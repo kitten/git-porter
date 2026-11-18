@@ -1,0 +1,79 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        default: ""
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@0a0da11f76bfa89d9193817a437868f94cbf82dc # v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - run: nix develop -c cargo fmt --all --check
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: nix develop -c python3 scripts/package_release.py --version --tag "$RELEASE_TAG"
+      - run: nix develop -c cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: nix develop -c python3 scripts/check_llp_refs.py
+      - run: nix develop -c python3 -m unittest discover -s tests/tools -p 'test_*.py'
+      - run: nix develop -c actionlint
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            system: aarch64-darwin
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@0a0da11f76bfa89d9193817a437868f94cbf82dc # v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - run: nix build --print-build-logs .#default
+      - name: OpenSSH acceptance
+        env:
+          GIT_PORTER_TEST_BIN: result/bin
+        run: nix develop -c cargo test --locked --test openssh -- --ignored
+      - name: Home Manager acceptance
+        if: matrix.system == 'x86_64-linux'
+        run: nix develop -c cargo test --locked --test managed -- --ignored
+      - name: Package and check portable installations
+        env:
+          SYSTEM: ${{ matrix.system }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          nix develop -c python3 scripts/package_release.py --package result --system "$SYSTEM" --output dist --tag "$RELEASE_TAG"
+          mkdir extracted
+          for archive in dist/*.tar.gz; do tar -xzf "$archive" -C extracted; done
+          for package in extracted/*; do
+            GIT_PORTER_TEST_BIN="$PWD/$package" nix develop -c cargo test --locked --test install
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: git-porter-${{ matrix.system }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
