@@ -18,6 +18,18 @@ So working across machines keeps the usual Git workflow, and an agent can call t
 
 [Skip to receiver setup](#set-up-a-receiver)
 
+## Installation
+
+Install git-porter on both the sender and receiver. With [Homebrew](https://github.com/kitten/homebrew-tap):
+
+```sh
+brew install kitten/tap/git-porter
+```
+
+To install manually, download the appropriate archive from the latest [release](https://github.com/kitten/git-porter/releases/latest), verify its supplied SHA256 checksum, and extract it. Place all three binaries—`git-porter`, `git-send` and `git-receive`—in a folder on your `PATH`.
+
+Git and OpenSSH are required. The sender uses its usual SSH identity; follow [receiver setup](#set-up-a-receiver) on the receiving account before sending branches.
+
 ## Sending and receiving
 
 To send the current branch from a sender to the receiver, which also forwards it to origin, use `git send`:
