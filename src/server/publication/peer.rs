@@ -2,6 +2,7 @@
 use crate::Result;
 use std::{
     os::fd::AsRawFd,
+    os::unix::fs::MetadataExt,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
@@ -10,7 +11,11 @@ pub(super) struct Process {
     pub pid: i32,
     pub parent: i32,
     pub birth: (u64, u64),
-    pub executable: PathBuf,
+    pub executable: (u64, u64),
+}
+fn executable(path: &Path) -> Result<(u64, u64)> {
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 #[cfg(target_os = "macos")]
 pub(super) fn process(pid: i32) -> Result<Process> {
@@ -40,7 +45,7 @@ pub(super) fn process(pid: i32) -> Result<Process> {
         pid,
         parent: info.pbi_ppid as i32,
         birth: (info.pbi_start_tvsec, info.pbi_start_tvusec),
-        executable: PathBuf::from(std::ffi::OsString::from_vec(path)),
+        executable: executable(&PathBuf::from(std::ffi::OsString::from_vec(path)))?,
     })
 }
 #[cfg(target_os = "linux")]
@@ -61,7 +66,7 @@ pub(super) fn process(pid: i32) -> Result<Process> {
         pid,
         parent: fields.get(1).ok_or("missing parent")?.parse()?,
         birth: (fields.get(19).ok_or("missing birth")?.parse()?, 0),
-        executable: std::fs::read_link(dir.join("exe"))?,
+        executable: executable(&dir.join("exe"))?,
     })
 }
 pub(super) fn peer(stream: &UnixStream) -> Result<Process> {
@@ -106,9 +111,10 @@ pub(super) fn peer(stream: &UnixStream) -> Result<Process> {
     process(pid)
 }
 pub(super) fn allowed(peer: &Process, owner: &Process, git: &Path, ssh: &Path) -> Result<()> {
-    if peer.executable != ssh {
+    if peer.executable != executable(ssh)? {
         return Err("agent peer is not the pinned ssh executable".into());
     }
+    let git = executable(git)?;
     let mut chain = vec![peer.clone()];
     let mut git_seen = false;
     for _ in 0..64 {
@@ -132,4 +138,22 @@ pub(super) fn allowed(peer: &Process, owner: &Process, git: &Path, ssh: &Path) -
         chain.push(parent);
     }
     Err("ssh peer is not descended from this publication's Git command".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_identity_accepts_hard_links_but_not_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("git");
+        let alias = root.path().join("git-core");
+        let copy = root.path().join("other-git");
+        std::fs::write(&original, b"executable").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        std::fs::copy(&original, &copy).unwrap();
+        assert_eq!(executable(&original).unwrap(), executable(&alias).unwrap());
+        assert_ne!(executable(&original).unwrap(), executable(&copy).unwrap());
+    }
 }

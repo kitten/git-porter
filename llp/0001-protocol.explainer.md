@@ -268,7 +268,9 @@ new encrypted credentials atomically; normal publishing does not write them.
 
 The temporary agent accepts only kernel-identified SSH peers (LOCAL_PEERPID on
 macOS, SO_PEERCRED on Linux), pinned executable and UID, beneath a Git
-executable in this receiver/forwarder's child tree. Revalidate a bounded
+executable in this receiver/forwarder's child tree. Pin executable file identity
+(device and inode), so hard-linked Git entry points identify the same binary
+while a copied binary does not. Revalidate a bounded
 ancestry chain and process birth identities before each request. Unauthorized
 peers consume no slot. Only trusted Ed25519 forge host keys are supported,
 selected through built-in trust and ssh-keygen's matching account known_hosts
