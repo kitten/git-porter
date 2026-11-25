@@ -218,6 +218,8 @@ pub fn acceptance(managed: bool) {
     for repo in [&client, &destination] {
         git(repo, &["remote", "add", "origin", &url]);
     }
+    // Exercise receiver observation before the publication signing exchange.
+    git(&client, &["config", "remote.origin.promisor", "true"]);
     if let Some(activation) = &activation {
         ok(command("bash", &receiver_home)
             .arg(activation)

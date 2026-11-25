@@ -73,6 +73,7 @@ fn installed_clients_discover_send_receive_and_preserve_worktree_and_ref_policy(
             "https://example.invalid/org/repo",
         ],
     ));
+    assert_ok(git(&source, &["config", "remote.origin.promisor", "true"]));
     let data = receiver_home.join(".local/share/git-porter");
     fs::create_dir_all(&data).unwrap();
     let hooks = data.join("hooks");
@@ -162,11 +163,54 @@ fn installed_clients_discover_send_receive_and_preserve_worktree_and_ref_policy(
     let detached = run(env!("CARGO_BIN_EXE_git-send"), &[]);
     assert!(!detached.status.success());
     assert!(String::from_utf8_lossy(&detached.stderr).contains("--branch <name>"));
+    let promisor = root.join("promisor.git");
+    assert_ok(git(
+        root,
+        &[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            promisor.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(
+        &promisor,
+        &["config", "uploadpack.allowFilter", "true"],
+    ));
+    assert_ok(git(
+        &source,
+        &[
+            "remote",
+            "add",
+            "cache",
+            &format!("file://{}", promisor.display()),
+        ],
+    ));
+    assert_ok(git(&source, &["config", "remote.cache.promisor", "true"]));
+    let blob = String::from_utf8(git(&source, &["rev-parse", "HEAD:payload"]).stdout).unwrap();
+    let blob = blob.trim();
+    fs::remove_file(
+        source
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    assert!(
+        !isolated_command("git", &source, root)
+            .args(["--no-lazy-fetch", "cat-file", "-e", blob])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     fs::write(&probes, "").unwrap();
     assert_ok(run(
         env!("CARGO_BIN_EXE_git-send"),
         &["--branch", "contributors/test"],
     ));
+    assert_ok(git(&source, &["--no-lazy-fetch", "cat-file", "-e", blob]));
+    assert_ok(git(&source, &["remote", "remove", "cache"]));
     let count = fs::read_to_string(&probes).unwrap().lines().count();
     assert!(
         count <= 3,
@@ -851,6 +895,7 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
         &["symbolic-ref", "HEAD", "refs/heads/@agent/a-fix"],
     ));
     assert_ok(git(&source, &["commit", "--allow-empty", "-qm", "first"]));
+    fs::remove_dir(source.join(".git/objects/pack")).unwrap();
     assert_ok(git(&target, &["init", "--bare", "-q"]));
     // Neither side has Porter setup. An origin on the receiver must not cause
     // forwarding when SSH grants an ordinary login instead of the forced command.
@@ -865,7 +910,8 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
     ));
     let ssh = root.join("ssh");
     let flipped = root.join("flip-route");
-    fs::write(&ssh, format!("#!/bin/sh\nfor arg do remote=$arg; done\nif test -e {}; then\ncase \"$remote\" in *git-receive-pack*) printf 'git-porter-route-v1:porter\\n'; exit 0 ;; esac\nfi\nexport HOME={}\ncd / || exit\nexec /bin/sh -c \"$remote\"\n", quote(&flipped), quote(&receiver))).unwrap();
+    let ssh_log = root.join("ssh-log");
+    fs::write(&ssh, format!("#!/bin/sh\nfor arg do remote=$arg; done\nprintf '%s\\n' \"$remote\" >> {}\nif test -e {}; then\ncase \"$remote\" in *git-receive-pack*) printf 'git-porter-route-v1:porter\\n'; exit 0 ;; esac\nfi\nexport HOME={}\ncd / || exit\nexec /bin/sh -c \"$remote\"\n", quote(&ssh_log), quote(&flipped), quote(&receiver))).unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let run = |binary: &str, checkout: &Path, flags: &[&str]| {
         let mut command = Command::new(binary);
@@ -899,6 +945,11 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
     let sent = run(env!("CARGO_BIN_EXE_git-send"), &source, &[]);
     assert!(!String::from_utf8_lossy(&sent.stderr).contains("Forwarded to"));
     assert_ok(sent);
+    assert_eq!(
+        fs::read_to_string(&ssh_log).unwrap().lines().count(),
+        1,
+        "full senders must skip receiver observation"
+    );
     let first = git(&source, &["rev-parse", "HEAD"]).stdout;
     assert_eq!(
         git(&target, &["rev-parse", "refs/heads/@agent/a-fix"]).stdout,
@@ -995,8 +1046,39 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
     assert!(!receiver.join(".local/share/git-porter").exists());
 }
 
+fn isolated_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    directory: &Path,
+    root: &Path,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .current_dir(directory)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+    for name in [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_DIRS",
+    ] {
+        command.env(name, root.join(name));
+    }
+    command
+}
+
 #[test]
-fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
+fn partial_clone_send_hydrates_from_promisor_without_receiver_maintenance() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let origin = root.join("origin");
@@ -1004,34 +1086,11 @@ fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
     let receiver = root.join("receiver.git");
     let log = root.join("ssh.log");
     let ssh = root.join("ssh");
-    let command = |program: &str, directory: &Path| {
-        let mut command = Command::new(program);
-        command
-            .env_clear()
-            .current_dir(directory)
-            .env("PATH", std::env::var_os("PATH").unwrap())
-            .env("HOME", &root)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "Fixture")
-            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Fixture")
-            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
-        for name in [
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-            "XDG_STATE_HOME",
-            "XDG_RUNTIME_DIR",
-            "XDG_CONFIG_DIRS",
-            "XDG_DATA_DIRS",
-        ] {
-            command.env(name, root.join(name));
-        }
-        command
-    };
     let git = |directory: &Path, args: &[&str]| {
-        let output = command("git", directory).args(args).output().unwrap();
+        let output = isolated_command("git", directory, &root)
+            .args(args)
+            .output()
+            .unwrap();
         assert_ok(output.clone());
         output
     };
@@ -1039,6 +1098,14 @@ fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
     git(&origin, &["init", "-q"]);
     git(&origin, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
     fs::write(origin.join("file"), "promised blob\n").unwrap();
+    fs::write(origin.join("second"), "another promised blob\n").unwrap();
+    for i in 0..256 {
+        fs::write(
+            origin.join(format!("blob-{i:03}")),
+            format!("payload {i}\n"),
+        )
+        .unwrap();
+    }
     git(&origin, &["add", "."]);
     git(&origin, &["commit", "-qm", "fixture"]);
     git(&origin, &["config", "uploadpack.allowFilter", "true"]);
@@ -1047,8 +1114,8 @@ fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
         &root,
         &[
             "clone",
-            "--bare",
-            "--filter=blob:none",
+            "--no-checkout",
+            "--filter=tree:0",
             &url,
             source.to_str().unwrap(),
         ],
@@ -1063,21 +1130,52 @@ fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
         ],
     );
     git(&receiver, &["update-ref", "-d", "refs/heads/topic"]);
-    // The receiver has the missing blob but must never serve a promisor fetch.
+    let bundle = root.join("external.bundle");
+    git(
+        &origin,
+        &[
+            "bundle",
+            "create",
+            bundle.to_str().unwrap(),
+            "refs/heads/topic",
+        ],
+    );
+    let bundles = root.join("bundles");
+    fs::write(&bundles, format!("[bundle]\nversion = 1\nmode = all\nheuristic = creationToken\n[bundle \"one\"]\nuri = file://{}\ncreationToken = 1\n", bundle.display())).unwrap();
+    git(
+        &source,
+        &[
+            "config",
+            "fetch.bundleURI",
+            &format!("file://{}", bundles.display()),
+        ],
+    );
+    // NOTE(@kitten): receiver objects must not mask a misrouted promisor fetch.
     git(
         &source,
         &["config", "remote.origin.url", "git@promisor.invalid:origin"],
     );
+    let permit = root.join("permit-promisor");
+    let guards = root.join("guards.log");
     fs::write(&ssh, format!(
-        "#!/bin/sh\nfor arg do remote=$arg; done\nprintf '%s\\n' \"$remote\" >> {}\nexec /bin/sh -c \"$remote\"\n",
-        quote(&log)
+        "#!/bin/sh\nfor arg do remote=$arg; done\nprintf '%s\\n' \"$remote\" >> {}\nif test \"$remote\" = \"git-upload-pack 'origin'\"; then {{ printf 'BEGIN\\n'; printf '%s\\n' \"$@\"; }} >> {}; fi\nif test -f {} && test \"$remote\" = \"git-upload-pack 'origin'\"; then exec git-upload-pack {}; fi\ncase \"$remote\" in git-receive-pack\\ *) unset GIT_NO_LAZY_FETCH;; esac\nexec /bin/sh -c \"$remote\"\n",
+        quote(&log), quote(&guards), quote(&permit), quote(&origin)
     )).unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let native_git = git_porter::server::config::executable("git").unwrap();
+    fs::write(bin.join("git"), format!("#!/bin/sh\nif test \"$GIT_ALLOW_PROTOCOL\" = ssh; then test \"$GIT_NO_LAZY_FETCH\" = 1 || exit 97; fi\nexec {} \"$@\"\n", quote(&native_git))).unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700)).unwrap();
     let send = || {
-        command(env!("CARGO_BIN_EXE_git-send"), &source)
+        isolated_command(env!("CARGO_BIN_EXE_git-send"), &source, &root)
             .env("GIT_SSH_COMMAND", &ssh)
             .env("GIT_SSH_VARIANT", "ssh")
             .env("GIT_NO_LAZY_FETCH", "0")
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
             .args(["--local-only", &format!("fixture:{}", receiver.display())])
             .output()
             .unwrap()
@@ -1090,26 +1188,956 @@ fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
     );
     let diagnostics = String::from_utf8_lossy(&failed.stderr);
     assert!(
-        diagnostics.contains("lazy fetching disabled"),
+        diagnostics.contains("required sender objects are unavailable"),
         "{diagnostics}"
     );
-    assert!(
-        !diagnostics.contains("filtering not recognized"),
-        "{diagnostics}"
-    );
-    assert!(!fs::read_to_string(&log).unwrap().contains("upload-pack"));
     assert!(git(&receiver, &["for-each-ref"]).stdout.is_empty());
-    // Hydration uses the normal repository transport, outside the Porter helper.
+    fs::write(&permit, "").unwrap();
+    git(&source, &["config", "remote.origin.promisor", "false"]);
+    git(
+        &source,
+        &["config", "--unset", "remote.origin.partialclonefilter"],
+    );
+    let no_promisor = send();
+    assert!(!no_promisor.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_promisor.stderr)
+            .contains("required sender objects have no configured promisor remote")
+    );
+    git(&source, &["config", "remote.origin.promisor", "true"]);
+    git(
+        &source,
+        &["config", "remote.origin.partialclonefilter", "tree:0"],
+    );
+    let pruned_source = root.join("pruned.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--filter=tree:0",
+            &url,
+            pruned_source.to_str().unwrap(),
+        ],
+    );
+    git(
+        &pruned_source,
+        &["config", "remote.origin.url", "git@promisor.invalid:origin"],
+    );
+    let entries = git(&origin, &["ls-tree", "-r", "HEAD"]);
+    let entries = String::from_utf8(entries.stdout).unwrap();
+    let missing_blob = entries
+        .lines()
+        .map(|line| line.split_whitespace().nth(2).unwrap())
+        .max()
+        .unwrap();
+    let blob_path = origin
+        .join(".git/objects")
+        .join(&missing_blob[..2])
+        .join(&missing_blob[2..]);
+    let saved_blob = fs::read(&blob_path).unwrap();
+    fs::remove_file(&blob_path).unwrap();
+    let attempts_before = fs::read_to_string(&log)
+        .unwrap()
+        .matches("git-upload-pack 'origin'")
+        .count();
+    let pruned = isolated_command(env!("CARGO_BIN_EXE_git-send"), &pruned_source, &root)
+        .env("GIT_SSH_COMMAND", &ssh)
+        .env("GIT_SSH_VARIANT", "ssh")
+        .args(["--local-only", &format!("fixture:{}", receiver.display())])
+        .output()
+        .unwrap();
+    fs::write(&blob_path, saved_blob).unwrap();
+    assert!(!pruned.status.success());
+    assert!(
+        String::from_utf8_lossy(&pruned.stderr).contains("required sender objects are unavailable")
+    );
+    let attempts = fs::read_to_string(&log)
+        .unwrap()
+        .matches("git-upload-pack 'origin'")
+        .count()
+        - attempts_before;
+    assert!(
+        attempts < 32,
+        "{attempts} fetches to isolate one missing blob among 258"
+    );
+    let before_config = fs::read(source.join(".git/config")).unwrap();
+    let fetches_before = fs::read_to_string(&log)
+        .unwrap()
+        .matches("git-upload-pack 'origin'")
+        .count();
+    assert_ok(send());
+    assert_eq!(fs::read(source.join(".git/config")).unwrap(), before_config);
+    let fetches_after = fs::read_to_string(&log)
+        .unwrap()
+        .matches("git-upload-pack 'origin'")
+        .count();
+    assert_eq!(
+        fetches_after - fetches_before,
+        2,
+        "fetch the tree, then its blobs in one request"
+    );
     git(&source, &["config", "remote.origin.url", &url]);
-    git(&source, &["cat-file", "blob", "HEAD:file"]);
+    git(&source, &["reset", "--hard", "HEAD"]);
+    fs::write(source.join("file"), "staged edit\n").unwrap();
+    git(&source, &["add", "file"]);
+    fs::write(source.join("file"), "unstaged edit\n").unwrap();
+    let index = fs::read(source.join(".git/index")).unwrap();
+    // NOTE(@kitten): advertising a commit does not promise local delta bases.
+    git(
+        &receiver,
+        &[
+            "config",
+            "remote.origin.url",
+            root.join("unavailable").to_str().unwrap(),
+        ],
+    );
+    git(&receiver, &["config", "remote.origin.promisor", "true"]);
+    let large = (0..5000)
+        .map(|i| format!("unchanged line {i}\n"))
+        .collect::<String>();
+    fs::write(origin.join("large"), &large).unwrap();
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-qm", "large base"]);
+    git(
+        &source,
+        &[
+            "fetch",
+            "--update-head-ok",
+            "origin",
+            "refs/heads/topic:refs/heads/topic",
+        ],
+    );
+    assert_ok(send());
+    let base = String::from_utf8(git(&origin, &["rev-parse", "HEAD:large"]).stdout).unwrap();
+    let base = base.trim();
+    fs::remove_file(receiver.join("objects").join(&base[..2]).join(&base[2..])).unwrap();
+    fs::write(
+        origin.join("large"),
+        large.replace("line 50\n", "line fifty\n"),
+    )
+    .unwrap();
+    git(&origin, &["commit", "-qam", "intermediate"]);
+    fs::write(
+        origin.join("large"),
+        large.replace("line 50\n", "line fifty-five\n"),
+    )
+    .unwrap();
+    git(&origin, &["commit", "-qam", "tip"]);
+    git(
+        &source,
+        &[
+            "fetch",
+            "--update-head-ok",
+            "origin",
+            "refs/heads/topic:refs/heads/topic",
+        ],
+    );
+    git(&source, &["remote", "add", "upstream", &url]);
+    git(
+        &source,
+        &["config", "remote.upstream.partialclonefilter", "blob:none"],
+    );
     git(
         &source,
         &["config", "remote.origin.url", "git@promisor.invalid:origin"],
     );
+    fs::remove_file(&permit).unwrap();
+    let tip = String::from_utf8(git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout).unwrap();
+    let mut refs = format!("{} refs/tags/nonutf8-", tip.trim()).into_bytes();
+    refs.extend_from_slice(b"\xff\n");
+    let tags = (0..20000)
+        .map(|i| format!("{} refs/tags/stale-{i:05}-{}\n", tip.trim(), "x".repeat(40)))
+        .collect::<String>();
+    refs.extend_from_slice(tags.as_bytes());
+    assert!(refs.len() > 1024 * 1024);
+    fs::write(receiver.join("packed-refs"), refs).unwrap();
+    let before_config = fs::read(source.join(".git/config")).unwrap();
+    let before_refs = git(&source, &["show-ref"]).stdout;
+    let before_fetch = fs::read(source.join(".git/FETCH_HEAD")).unwrap();
     assert_ok(send());
+    assert_eq!(fs::read(source.join(".git/config")).unwrap(), before_config);
+    assert_eq!(git(&source, &["show-ref"]).stdout, before_refs);
+    assert_eq!(
+        fs::read(source.join(".git/FETCH_HEAD")).unwrap(),
+        before_fetch
+    );
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(source.join("file")).unwrap(), b"unstaged edit\n");
     assert_eq!(
         git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout,
         git(&source, &["rev-parse", "HEAD"]).stdout
     );
-    assert!(!fs::read_to_string(&log).unwrap().contains("upload-pack"));
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("git-upload-pack "))
+            .all(|line| line == "git-upload-pack 'origin'")
+    );
+    let guards = fs::read_to_string(&guards).unwrap();
+    assert!(guards.starts_with("BEGIN\n"));
+    for call in guards.split("BEGIN\n").skip(1) {
+        assert!(
+            call.starts_with(
+                "-a\n-o\nForwardAgent=no\n-S\nnone\n-o\nControlMaster=no\n-o\nControlPersist=no\n"
+            ),
+            "{call}"
+        );
+    }
+}
+
+fn seed_history(forge: &Path, root: &Path, count: usize) {
+    use std::{io::Write, process::Stdio};
+    let mut import = isolated_command("git", forge, root)
+        .arg("fast-import")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = import.stdin.take().unwrap();
+    for i in 1..=count {
+        writeln!(stream, "commit refs/heads/main\nmark :{i}\ncommitter Fixture <fixture@example.invalid> {} +0000\ndata 1\nx", 1_700_000_000 + i).unwrap();
+        if i > 1 {
+            writeln!(stream, "from :{}", i - 1).unwrap();
+        }
+        let blob = format!("historical blob {i}\n");
+        writeln!(
+            stream,
+            "M 100644 inline file\ndata {}\n{}",
+            blob.len(),
+            blob
+        )
+        .unwrap();
+        writeln!(stream).unwrap();
+    }
+    drop(stream);
+    assert_ok(import.wait_with_output().unwrap());
+    assert_ok(
+        isolated_command("git", forge, root)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn shallow_send_deepens_to_receiver_history_without_changing_refs() {
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    for partial in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let forge = root.join("forge.git");
+        let source = root.join("sender.git");
+        let receiver = root.join("receiver.git");
+        let git = |directory: &Path, args: &[&str]| {
+            let output = isolated_command("git", directory, &root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert_ok(output.clone());
+            output
+        };
+        git(&root, &["init", "--bare", "-q", forge.to_str().unwrap()]);
+        seed_history(&forge, &root, 4096);
+        let common = git(&forge, &["rev-parse", "main~3096"]);
+        let common = String::from_utf8(common.stdout).unwrap();
+        git(&forge, &["branch", "receiver-base", common.trim()]);
+        git(
+            &forge,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "shared",
+                "-m",
+                "shared",
+                "receiver-base",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "--depth=1",
+                "--branch",
+                "receiver-base",
+                &format!("file://{}", forge.display()),
+                receiver.to_str().unwrap(),
+            ],
+        );
+        if partial {
+            git(&receiver, &["update-ref", "-d", "refs/heads/receiver-base"]);
+        }
+        let receiver_boundary = fs::read(receiver.join("shallow")).unwrap();
+        let url = format!("file://{}", forge.display());
+        git(&forge, &["config", "uploadpack.allowFilter", "true"]);
+        let mut clone = vec!["clone", "--no-checkout", "--depth=2"];
+        if partial {
+            clone.push("--filter=blob:none");
+        }
+        clone.extend([&url, source.to_str().unwrap()]);
+        git(&root, &clone);
+        if partial {
+            git(&source, &["config", "extensions.partialClone", "origin"]);
+            git(&source, &["config", "--unset", "remote.origin.promisor"]);
+            git(
+                &source,
+                &["config", "--unset", "remote.origin.partialclonefilter"],
+            );
+        }
+        if partial {
+            git(
+                &source,
+                &[
+                    "-c",
+                    "fetch.negotiationAlgorithm=noop",
+                    "-c",
+                    "remote.origin.partialclonefilter=blob:none",
+                    "fetch",
+                    "--depth=1",
+                    "--no-write-fetch-head",
+                    "--no-tags",
+                    "--refmap=",
+                    "origin",
+                    "refs/tags/shared",
+                ],
+            );
+        } else {
+            let missing = isolated_command("git", &source, &root)
+                .args(["--no-lazy-fetch", "cat-file", "-e", common.trim()])
+                .output()
+                .unwrap();
+            assert!(
+                !missing.status.success(),
+                "receiver branch tip must become known through deepening"
+            );
+        }
+        git(&source, &["branch", "-m", "topic"]);
+        let tree = git(&source, &["rev-parse", "HEAD^{tree}"]);
+        let local = git(
+            &source,
+            &[
+                "commit-tree",
+                String::from_utf8_lossy(&tree.stdout).trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                "unpublished",
+            ],
+        );
+        git(
+            &source,
+            &[
+                "update-ref",
+                "refs/heads/topic",
+                String::from_utf8_lossy(&local.stdout).trim(),
+            ],
+        );
+        git(&source, &["read-tree", "HEAD"]);
+        fs::write(source.join("file"), "uncommitted worktree edit\n").unwrap();
+        let index = fs::read(source.join(".git/index")).unwrap();
+        let block = root.join("block-pack");
+        let pack = root.join("pack-hook");
+        fs::write(
+            &pack,
+            format!(
+                "#!/bin/sh\nwhile test -e {}; do sleep 0.02; done\nexec \"$@\"\n",
+                quote(&block)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0o700)).unwrap();
+        let upload = root.join("upload");
+        fs::write(
+            &upload,
+            format!(
+                "#!/bin/sh\nexec git -c {} upload-pack \"$@\"\n",
+                quote(Path::new(&format!(
+                    "uploadpack.packObjectsHook={}",
+                    pack.display()
+                )))
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&upload, fs::Permissions::from_mode(0o700)).unwrap();
+        git(
+            &source,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                upload.to_str().unwrap(),
+            ],
+        );
+        if partial {
+            git(&source, &["remote", "add", "aab-plain", &url]);
+            git(
+                &source,
+                &[
+                    "config",
+                    "remote.aab-plain.uploadpack",
+                    upload.to_str().unwrap(),
+                ],
+            );
+        }
+        git(
+            &source,
+            &[
+                "remote",
+                "add",
+                "aaa-dead",
+                root.join("unavailable").to_str().unwrap(),
+            ],
+        );
+        let refs = git(&source, &["show-ref"]).stdout;
+        let shallow = fs::read(source.join(".git/shallow")).unwrap();
+        let config = fs::read(source.join(".git/config")).unwrap();
+        let ssh = root.join("ssh");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\nfor arg do remote=$arg; done\nexec /bin/sh -c \"$remote\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let trace = root.join("trace.json");
+        let send = |destination: &Path| {
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_git-send"), &source, &root);
+            command
+                .env("GIT_TRACE2_EVENT", &trace)
+                .env("GIT_SSH_COMMAND", &ssh)
+                .env("GIT_SSH_VARIANT", "ssh")
+                .args([
+                    "--local-only",
+                    &format!("fixture:{}", destination.display()),
+                ]);
+            command
+        };
+        git(
+            &source,
+            &[
+                "config",
+                "remote.origin.url",
+                root.join("unavailable").to_str().unwrap(),
+            ],
+        );
+        if partial {
+            git(
+                &source,
+                &[
+                    "config",
+                    "remote.aab-plain.url",
+                    root.join("unavailable").to_str().unwrap(),
+                ],
+            );
+        }
+        let refused = send(&receiver).output().unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("cannot deepen required sender history")
+        );
+        assert_eq!(fs::read(source.join(".git/shallow")).unwrap(), shallow);
+        assert!(
+            git(&receiver, &["for-each-ref", "refs/heads/topic"])
+                .stdout
+                .is_empty()
+        );
+        git(&source, &["config", "remote.origin.url", &url]);
+        if partial {
+            git(&source, &["config", "remote.aab-plain.url", &url]);
+        }
+        let native_lock = source.join(".git/shallow.lock");
+        fs::write(&native_lock, "native Git owns this lock\n").unwrap();
+        assert!(!send(&receiver).output().unwrap().status.success());
+        assert_eq!(
+            fs::read(&native_lock).unwrap(),
+            b"native Git owns this lock\n"
+        );
+        assert_eq!(fs::read(source.join(".git/shallow")).unwrap(), shallow);
+        fs::remove_file(&native_lock).unwrap();
+        let wait_for_lock = |child: &mut std::process::Child| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+                if source.join(".git/shallow.lock").exists() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+        fs::write(&block, "").unwrap();
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let mut interrupted = send(&receiver)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let locked = wait_for_lock(&mut interrupted);
+            unsafe {
+                libc::kill(interrupted.id() as i32, signal);
+            }
+            let output = interrupted.wait_with_output().unwrap();
+            assert!(locked, "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(!output.status.success());
+            assert!(!source.join(".git/shallow.lock").exists());
+            assert_eq!(fs::read(source.join(".git/shallow")).unwrap(), shallow);
+        }
+        fs::write(&trace, "").unwrap();
+        let other = root.join("other.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "--depth=1",
+                "--branch",
+                "receiver-base",
+                &url,
+                other.to_str().unwrap(),
+            ],
+        );
+        let mut first = send(&receiver)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let locked = wait_for_lock(&mut first);
+        let trace_offset = fs::read(&trace).unwrap().len();
+        let mut second = send(&other)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reached_lock = loop {
+            let trace_bytes = fs::read(&trace).unwrap();
+            let events: Vec<serde_json::Value> =
+                String::from_utf8_lossy(&trace_bytes[trace_offset..])
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+            let completed = events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "start"
+                        && event["argv"].as_array().is_some_and(|args| {
+                            args.last().is_some_and(|arg| arg == "--git-common-dir")
+                        })
+                        && events
+                            .iter()
+                            .any(|exit| exit["event"] == "exit" && exit["sid"] == event["sid"])
+                })
+                .count();
+            if completed >= 1 {
+                break true;
+            }
+            if Instant::now() >= deadline || second.try_wait().unwrap().is_some() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let waiting = second.try_wait().unwrap().is_none();
+        fs::remove_file(&block).unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        assert!(locked && reached_lock && waiting);
+        assert_ok(first);
+        assert_ok(second);
+        assert_eq!(git(&source, &["show-ref"]).stdout, refs);
+        assert_eq!(fs::read(source.join(".git/config")).unwrap(), config);
+        assert_eq!(fs::read(source.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            fs::read(source.join("file")).unwrap(),
+            b"uncommitted worktree edit\n"
+        );
+        assert!(!source.join(".git/FETCH_HEAD").exists());
+        assert_ne!(fs::read(source.join(".git/shallow")).unwrap(), shallow);
+        assert_eq!(
+            git(&source, &["rev-parse", "--is-shallow-repository"]).stdout,
+            b"true\n"
+        );
+        assert_eq!(
+            git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout,
+            local.stdout
+        );
+        assert_eq!(
+            fs::read(receiver.join("shallow")).unwrap(),
+            receiver_boundary
+        );
+        let events: Vec<serde_json::Value> = fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .filter_map(|event| event["argv"].as_array())
+            .collect();
+        for depth in [256, 512, 1024, 2048] {
+            assert!(
+                starts
+                    .iter()
+                    .any(|args| args.iter().any(|arg| arg == &format!("--deepen={depth}")))
+            );
+        }
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "aaa-dead"))
+                .count(),
+            1
+        );
+        if partial {
+            let old_blob = git(&forge, &["rev-parse", "main~4095:file"]);
+            let missing = isolated_command("git", &source, &root)
+                .args([
+                    "--no-lazy-fetch",
+                    "cat-file",
+                    "-e",
+                    String::from_utf8_lossy(&old_blob.stdout).trim(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !missing.status.success(),
+                "plain deepening remote hydrated excluded historical blobs"
+            );
+        }
+        let stable = fs::read(source.join(".git/shallow")).unwrap();
+        assert_ok(send(&receiver).output().unwrap());
+        assert_eq!(fs::read(source.join(".git/shallow")).unwrap(), stable);
+        let empty = root.join("empty.git");
+        git(&root, &["init", "--bare", "-q", empty.to_str().unwrap()]);
+        assert_ok(send(&empty).output().unwrap());
+        assert!(!source.join(".git/shallow").exists());
+        assert_eq!(git(&source, &["show-ref"]).stdout, refs);
+        assert_eq!(
+            git(&empty, &["rev-parse", "refs/heads/topic"]).stdout,
+            local.stdout
+        );
+    }
+}
+
+#[test]
+fn current_receiver_does_not_hydrate_excluded_historical_blobs() {
+    use std::{io::Write, process::Stdio};
+    for (filter, hidden) in [("blob:none", false), ("tree:0", false), ("blob:none", true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let forge = root.join("forge.git");
+        let source = root.join("sender.git");
+        let receiver = root.join("receiver.git");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = isolated_command("git", repo, &root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert_ok(output.clone());
+            output
+        };
+        git(&root, &["init", "--bare", "-q", forge.to_str().unwrap()]);
+        seed_history(&forge, &root, 512);
+        let original_tree = git(&forge, &["rev-parse", "HEAD^{tree}"]);
+        let original_tip = git(&forge, &["rev-parse", "HEAD"]);
+        let mut import = isolated_command("git", &forge, &root)
+            .arg("fast-import")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        write!(import.stdin.take().unwrap(), "commit refs/heads/main\ncommitter Fixture <fixture@example.invalid> 1700000513 +0000\ndata 1\nx\nfrom {}\nR file a/inner/file\n\n", String::from_utf8_lossy(&original_tip.stdout).trim()).unwrap();
+        assert_ok(import.wait_with_output().unwrap());
+        git(&forge, &["config", "uploadpack.allowFilter", "true"]);
+        let url = format!("file://{}", forge.display());
+        git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "--filter",
+                filter,
+                &url,
+                source.to_str().unwrap(),
+            ],
+        );
+        git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                forge.to_str().unwrap(),
+                receiver.to_str().unwrap(),
+            ],
+        );
+        if hidden {
+            git(
+                &receiver,
+                &["config", "receive.hideRefs", "refs/heads/main"],
+            );
+        }
+        git(&source, &["config", "pack.usePathWalk", "true"]);
+        let parent = git(&forge, &["rev-parse", "HEAD"]);
+        let tree_entry = git(&forge, &["ls-tree", "HEAD"]);
+        let mut tree = isolated_command("git", &source, &root)
+            .args(["mktree", "--missing"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            tree.stdin.take().unwrap(),
+            "{}040000 tree {}\tb",
+            String::from_utf8(tree_entry.stdout).unwrap(),
+            String::from_utf8_lossy(&original_tree.stdout).trim()
+        )
+        .unwrap();
+        let tree = tree.wait_with_output().unwrap();
+        assert!(tree.status.success());
+        let mut commit = isolated_command("git", &source, &root)
+            .args(["hash-object", "-w", "-t", "commit", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        write!(commit.stdin.take().unwrap(), "tree {}\nparent {}\nauthor Fixture <fixture@example.invalid> 1700000513 +0000\ncommitter Fixture <fixture@example.invalid> 1700000513 +0000\n\nunpublished\n",
+            String::from_utf8_lossy(&tree.stdout).trim(), String::from_utf8_lossy(&parent.stdout).trim()).unwrap();
+        let commit = commit.wait_with_output().unwrap();
+        assert!(commit.status.success());
+        git(
+            &source,
+            &[
+                "update-ref",
+                "refs/heads/topic",
+                String::from_utf8_lossy(&commit.stdout).trim(),
+            ],
+        );
+        let ssh = root.join("ssh");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\nfor arg do remote=$arg; done\nexec /bin/sh -c \"$remote\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_ok(
+            isolated_command(env!("CARGO_BIN_EXE_git-send"), &source, &root)
+                .env("GIT_SSH_COMMAND", &ssh)
+                .env("GIT_SSH_VARIANT", "ssh")
+                .args([
+                    "--local-only",
+                    "--branch",
+                    "topic",
+                    &format!("fixture:{}", receiver.display()),
+                ])
+                .output()
+                .unwrap(),
+        );
+        let types = git(
+            &source,
+            &[
+                "--no-lazy-fetch",
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objecttype)",
+            ],
+        );
+        assert!(
+            hidden
+                || !String::from_utf8_lossy(&types.stdout)
+                    .lines()
+                    .any(|kind| kind == "blob"),
+            "{filter}: historical blobs were hydrated"
+        );
+        assert_eq!(
+            git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout,
+            commit.stdout
+        );
+        if hidden {
+            continue;
+        }
+        git(
+            &receiver,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "receiver-only",
+                "-m",
+                "receiver-only",
+                String::from_utf8_lossy(&parent.stdout).trim(),
+            ],
+        );
+        git(&receiver, &["update-ref", "-d", "refs/heads/main"]);
+        git(&receiver, &["update-ref", "-d", "refs/heads/topic"]);
+        assert_ok(
+            isolated_command(env!("CARGO_BIN_EXE_git-send"), &source, &root)
+                .env("GIT_SSH_COMMAND", &ssh)
+                .env("GIT_SSH_VARIANT", "ssh")
+                .args([
+                    "--local-only",
+                    "--branch",
+                    "topic",
+                    &format!("fixture:{}", receiver.display()),
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout,
+            commit.stdout
+        );
+    }
+}
+
+#[test]
+fn merged_shallow_promisors_supply_disjoint_roots_and_objects() {
+    use std::{io::Write, process::Stdio};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let fork = root.join("fork.git");
+    let upstream = root.join("upstream.git");
+    let source = root.join("sender.git");
+    let receiver = root.join("receiver.git");
+    let git = |repo: &Path, args: &[&str]| {
+        let output = isolated_command("git", repo, &root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(output.clone());
+        output
+    };
+    git(&root, &["init", "--bare", "-q", fork.to_str().unwrap()]);
+    seed_history(&fork, &root, 2);
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            fork.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+        ],
+    );
+    let mut tips = Vec::new();
+    let mut entries = Vec::new();
+    for (repo, name) in [(&fork, "fork"), (&upstream, "upstream")] {
+        let parent = git(repo, &["rev-parse", "HEAD"]);
+        let mut import = isolated_command("git", repo, &root)
+            .arg("fast-import")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        write!(import.stdin.take().unwrap(), "commit refs/heads/main\ncommitter Fixture <fixture@example.invalid> 1700000003 +0000\ndata 1\nx\nfrom {}\nM 100644 inline file\ndata {}\n{}\n\n", String::from_utf8_lossy(&parent.stdout).trim(), name.len(), name).unwrap();
+        assert_ok(import.wait_with_output().unwrap());
+        git(repo, &["config", "uploadpack.allowFilter", "true"]);
+        tips.push(String::from_utf8(git(repo, &["rev-parse", "HEAD"]).stdout).unwrap());
+        let blob = git(repo, &["rev-parse", "HEAD:file"]);
+        writeln!(
+            entries,
+            "100644 blob {}\t{name}",
+            String::from_utf8_lossy(&blob.stdout).trim()
+        )
+        .unwrap();
+    }
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--depth=1",
+            "--filter=blob:none",
+            &format!("file://{}", fork.display()),
+            source.to_str().unwrap(),
+        ],
+    );
+    git(
+        &source,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            &format!("file://{}", upstream.display()),
+        ],
+    );
+    git(&source, &["config", "remote.upstream.promisor", "true"]);
+    git(
+        &source,
+        &["config", "remote.upstream.partialclonefilter", "blob:none"],
+    );
+    git(
+        &source,
+        &[
+            "fetch",
+            "--depth=1",
+            "--no-write-fetch-head",
+            "upstream",
+            "refs/heads/main:refs/heads/upstream",
+        ],
+    );
+    let mut tree = isolated_command("git", &source, &root)
+        .args(["mktree", "--missing"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    tree.stdin.take().unwrap().write_all(&entries).unwrap();
+    let tree = tree.wait_with_output().unwrap();
+    assert_ok(tree.clone());
+    let commit = git(
+        &source,
+        &[
+            "commit-tree",
+            String::from_utf8_lossy(&tree.stdout).trim(),
+            "-p",
+            tips[0].trim(),
+            "-p",
+            tips[1].trim(),
+            "-m",
+            "merge",
+        ],
+    );
+    git(
+        &source,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            String::from_utf8_lossy(&commit.stdout).trim(),
+        ],
+    );
+    git(&root, &["init", "--bare", "-q", receiver.to_str().unwrap()]);
+    let refs = git(&source, &["show-ref"]).stdout;
+    let config = fs::read(source.join("config")).unwrap();
+    let ssh = root.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor arg do remote=$arg; done\nexec /bin/sh -c \"$remote\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ok(
+        isolated_command(env!("CARGO_BIN_EXE_git-send"), &source, &root)
+            .env("GIT_SSH_COMMAND", &ssh)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .args(["--local-only", &format!("fixture:{}", receiver.display())])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        git(&receiver, &["rev-parse", "refs/heads/main"]).stdout,
+        commit.stdout
+    );
+    assert_eq!(git(&source, &["show-ref"]).stdout, refs);
+    assert_eq!(fs::read(source.join("config")).unwrap(), config);
+    assert!(!source.join("FETCH_HEAD").exists());
+    assert!(!source.join("shallow").exists());
 }

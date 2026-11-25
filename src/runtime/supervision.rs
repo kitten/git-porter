@@ -13,6 +13,7 @@ use std::{
 };
 const MARKER: &str = "--porter-owned-command";
 const CONTROL: &str = "GIT_PORTER_CHILD_CONTROL";
+const GIT_CLEANUP: &str = "GIT_PORTER_GIT_CLEANUP";
 
 /// Preserve normal Command environment/stdio behavior through an exec-only entry.
 /// Session::spawn enables the separate key-free guardian for long-lived children.
@@ -46,7 +47,11 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         executable
     };
     let mut command = Command::new(executable);
-    command.arg(MARKER).arg(program).env_remove(CONTROL);
+    command
+        .arg(MARKER)
+        .arg(program)
+        .env_remove(CONTROL)
+        .env_remove(GIT_CLEANUP);
     command
 }
 
@@ -151,7 +156,12 @@ pub fn dispatch() -> Option<Result<()>> {
     let invoked = std::env::args_os().next().unwrap_or_default();
     if std::path::Path::new(&invoked)
         .file_name()
-        .is_some_and(|name| name == "pre-receive" || name == "ssh" || name == "client-ssh")
+        .is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some("pre-receive" | "ssh" | "client-ssh" | "hydration-ssh")
+            )
+        })
     {
         return None;
     }
@@ -180,7 +190,11 @@ fn guardian(args: &[std::ffi::OsString]) -> Result<()> {
     use std::os::unix::process::ExitStatusExt;
     let program = args.first().ok_or("missing owned executable")?;
     let mut command = Command::new(program);
-    command.args(&args[1..]).env_remove(CONTROL);
+    let git_cleanup = std::env::var_os(GIT_CLEANUP).is_some_and(|value| value == "1");
+    command
+        .args(&args[1..])
+        .env_remove(CONTROL)
+        .env_remove(GIT_CLEANUP);
     if std::env::var_os(CONTROL).is_none() {
         return Err(command.exec().into());
     }
@@ -237,6 +251,18 @@ fn guardian(args: &[std::ffi::OsString]) -> Result<()> {
             }
         }
     })();
+    if result.is_err() && git_cleanup {
+        unsafe {
+            libc::kill(-group, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+    }
     unsafe {
         libc::kill(-group, libc::SIGKILL);
     }

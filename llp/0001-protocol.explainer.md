@@ -296,7 +296,9 @@ remain in their original zeroizing allocation through parsing rather than
 passing through an ordinary buffer copy. No extra plaintext persistence is
 introduced. Native Git/SSH children use the key-free exec guardian and bounded
 process groups; owner liveness EOF must kill/reap descendants while preserving
-Git's native streams. Before native launch, the guardian announces readiness and
+Git's native streams. Give hydration fetches a 500 ms SIGTERM window before
+process-group SIGKILL so Git can remove shallow.lock on cancellation or owner
+death. Before native launch, the guardian announces readiness and
 requires an owner permit. The owner's entire readiness/permit/PID handshake is
 cancellation-aware and bounded by two seconds or the remaining receiver lifetime.
 The permit carries an absolute monotonic expiry; the guardian rejects missing,

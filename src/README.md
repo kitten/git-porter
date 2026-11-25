@@ -23,7 +23,8 @@ credential paths; [transaction orchestration](server/publication/mod.rs) owns wh
 those credentials may be used. The git_porter library is internal: binaries and tests
 use these subsystem paths directly, without a second layer of compatibility aliases.
 
-[Client orchestration](cli/client/mod.rs) owns branch operations; its
+[Client orchestration](cli/client/mod.rs) owns branch operations;
+[hydration](cli/client/hydration.rs) prepares sender objects and history; the
 [transport role](cli/client/transport.rs) owns SSH negotiation and byte handoff,
 [key commands](cli/keys.rs) handle enrollment and prompts,
 [provisioning](cli/client/provision.rs) owns approved remote key participation,

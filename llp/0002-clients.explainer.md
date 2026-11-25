@@ -199,8 +199,8 @@ built-in excludes node_modules, target and Library.
 [Clients](../src/cli/client/mod.rs) use a private per-operation remote name,
 fixed URL and pushurl, excluding repository remote helpers and pushInsteadOf
 redirects. Resolve the operation’s effective URL once without connecting, require native SSH syntax
-(reject ssh:: external helpers), and whitelist GIT_ALLOW_PROTOCOL=ssh for push,
-lease observation and fetch. Force the adjacent compiled helper through
+(reject ssh:: external helpers), and whitelist GIT_ALLOW_PROTOCOL=ssh for
+receiver-ref observation, push, lease observation and receive fetch. Force the adjacent compiled helper through
 GIT_SSH_COMMAND and GIT_SSH; shell-quote the GIT_SSH_COMMAND path so TMPDIR
 characters cannot split or substitute the helper. The helper pins intended
 host/path/identity rather than rewritten argv. Disable forwarding and masters.
@@ -255,12 +255,53 @@ configuration and hooks. Use explicit --no-follow-tags --recurse-submodules=no
 --signed=false, clear inherited push.pushOption and disable push.negotiate. Do
 not override merge.verifySignatures or bypass client hooks.
 
-Disable lazy object fetching in commands using the receiver-pinned SSH helper.
-A promisor fetch must never inherit that helper and contact the transfer receiver
-in place of its configured promisor. Missing required sender objects fail the
-transfer; hydrate incomplete partial clones through their ordinary repository
-transport before sending. This does not change the isolated forwarder's
-origin-bound hydration policy.
+Disable lazy fetching under the receiver-pinned SSH helper. Before each send
+push from a shallow or partial sender, stream receiver refs to a private file
+through receive-pack, without publication negotiation. Use a separate receiver
+connection for this observation. Retain the Porter receiver's normal
+receive-pack repository write lock during observation; fail if it is busy. Use
+ref objects rather than peeled IDs from opaque receiver-only tags. Exclude
+advertised commits available in the sender from hydration walks, peeling
+annotated tags available locally. Skip observation and object catalogs for
+full, non-shallow senders. Recognize partial senders by promisor configuration
+or promisor packs.
+
+Serialize git-send hydration with an advisory flock on the common Git
+directory; do not treat this as serialization with native Git. Deepen outgoing
+shallow roots through configured sender remotes, starting at 256 and doubling
+each successful step until shared receiver history or full history is reached.
+Prefer the last successful deepening remote and try other configured remotes
+when it cannot advance the frontier. If no remote advances the combined
+frontier, try roots separately until one advances so merged fork/upstream
+histories can progress independently. Re-evaluate the same observed receiver
+IDs after deepening; do not observe again. Treat receiver tips unknown locally
+as unusable packing haves; permit full-history deepening and hydration when no
+usable shared history remains, even if the receiver is merely ahead of a stale
+sender. Preserve the invocation's fixed 1200-second lifetime across hydration
+and the final push; fail before the push if deepening exhausts that budget. Do
+not reserve a separate push quota; retain the existing uncertain-outcome
+handling if the lifetime expires during a push or publication.
+
+Resolve boundary trees before enumerating outgoing objects; keep excluded
+historical blobs unhydrated. Request each walk's missing IDs together from a
+sender promisor; try the remaining configured promisors if it cannot supply
+them. If every promisor rejects a request, split it in halves and retry the
+halves through the promisors. Fail when a single ID remains unavailable;
+rewalk after successful requests and retain the no-progress check. Use a
+separate SSH role with the selected user SSH command, actual configured remote
+endpoints, forwarding off and multiplexing off. Preserve refs, configuration,
+FETCH_HEAD, index and worktrees. Disable fetch.bundleURI for hydration fetches
+so bundles cannot write refs or configuration. Use noop fetch negotiation so
+local commit haves cannot imply that missing objects or delta bases are
+available. For partial senders, use a command-scoped blob:none filter for
+fetches, including deepening through plain remotes; rewalk fetched trees. Fail
+before the push when neither objects nor shallow roots advance.
+
+Keep lazy fetching disabled for the final push. Disable sparse packing so its
+object selection agrees with the hydration catalog. Always use --no-thin
+because receivers can be partial. Retain the isolated forwarder's origin-bound
+hydration policy. On a receiver-ref change between observation and push,
+report native push failure without an automatic retry.
 
 ## Push status
 

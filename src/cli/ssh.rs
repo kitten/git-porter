@@ -139,7 +139,7 @@ pub(crate) fn selected() -> Result<String> {
     require_openssh(&variant)?;
     Ok(serde_json::to_string(&selection)?)
 }
-fn guarded_command() -> Result<Command> {
+pub(crate) fn guarded_command() -> Result<Command> {
     let encoded = std::env::var("GIT_PORTER_USER_SSH")
         .map(Ok)
         .unwrap_or_else(|_| selected())?;

@@ -2,6 +2,7 @@
 //! @ref LLP 0002#installation-boundary
 use crate::Result;
 use std::process::Command;
+mod hydration;
 pub(crate) mod provision;
 mod repository;
 mod signing;
@@ -149,7 +150,7 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
     if !admin.is_file() {
         return Err("git-porter must be installed beside git-send/git-receive".into());
     }
-    std::os::unix::fs::symlink(admin, &helper)?;
+    std::os::unix::fs::symlink(&admin, &helper)?;
     // A private name prevents repository remote.<name>.vcs/pushurl settings
     // from selecting a helper or another endpoint for our internal transfer.
     let remote = temporary.path().file_name().unwrap().to_str().unwrap();
@@ -184,8 +185,8 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
         // This must override repository/global core.sshCommand, otherwise Git
         // bypasses the controlled negotiation.
         // URL rewrites may change the protocol before Git consults the helper.
-        // Whitelist SSH for push, lease observation and fetch alike; the helper
-        // ignores rewritten host/path arguments and uses the pinned intent.
+        // Whitelist SSH for every receiver operation; the helper ignores
+        // rewritten host/path arguments and uses the pinned intent.
         cmd.args(["-c", &remote_setting, "-c", &push_setting])
             .env("GIT_PORTER_USER_SSH", &user_ssh)
             // Lazy fetch children would inherit this receiver-pinned helper and
@@ -218,6 +219,22 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
     if !receive {
         let sha =
             repository.output(&["rev-parse", "--verify", &format!("{reference}^{{commit}}")])?;
+        let mut observe = make();
+        observe.env("GIT_PORTER_CLIENT_PUBLISH", "false").args([
+            "ls-remote",
+            "--upload-pack=git-receive-pack",
+            "--refs",
+            remote,
+        ]);
+        hydration::prepare(
+            &repository,
+            &sha,
+            observe,
+            &user_ssh,
+            &admin,
+            temporary.path(),
+            &session,
+        )?;
         let mut push = make();
         push.env("GIT_PORTER_CLIENT_REF", &reference)
             .env("GIT_PORTER_CLIENT_SHA", &sha)
@@ -236,10 +253,13 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
             "push.pushOption=",
             "-c",
             "push.negotiate=false",
+            "-c",
+            "pack.useSparse=false",
             "push",
             "--porcelain",
             "--signed=false",
             "--no-follow-tags",
+            "--no-thin",
             "--recurse-submodules=no",
         ]);
         if quiet {

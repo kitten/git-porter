@@ -11,6 +11,16 @@ pub fn run() -> Result<()> {
     if crate::cli::client::transport::is_role(Path::new(&arguments[0])) {
         return crate::cli::client::transport::run();
     }
+    if Path::new(&arguments[0])
+        .file_name()
+        .is_some_and(|name| name == "hydration-ssh")
+    {
+        use std::os::unix::process::CommandExt;
+        return Err(crate::cli::ssh::guarded_command()?
+            .args(&arguments[1..])
+            .exec()
+            .into());
+    }
     let invoked = Path::new(&arguments[0])
         .file_name()
         .and_then(|s| s.to_str())
