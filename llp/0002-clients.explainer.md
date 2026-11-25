@@ -255,6 +255,13 @@ configuration and hooks. Use explicit --no-follow-tags --recurse-submodules=no
 --signed=false, clear inherited push.pushOption and disable push.negotiate. Do
 not override merge.verifySignatures or bypass client hooks.
 
+Disable lazy object fetching in commands using the receiver-pinned SSH helper.
+A promisor fetch must never inherit that helper and contact the transfer receiver
+in place of its configured promisor. Missing required sender objects fail the
+transfer; hydrate incomplete partial clones through their ordinary repository
+transport before sending. This does not change the isolated forwarder's
+origin-bound hydration policy.
+
 ## Push status
 
 Refusals state the observed failure, not a presumed fix. A missing sender-key

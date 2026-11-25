@@ -188,6 +188,9 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
         // ignores rewritten host/path arguments and uses the pinned intent.
         cmd.args(["-c", &remote_setting, "-c", &push_setting])
             .env("GIT_PORTER_USER_SSH", &user_ssh)
+            // Lazy fetch children would inherit this receiver-pinned helper and
+            // fetch from the receiver instead of their configured promisor.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_ALLOW_PROTOCOL", "ssh")
             .env("GIT_SSH_COMMAND", crate::cli::ssh::quoted_path(&helper))
             .env("GIT_SSH", &helper)

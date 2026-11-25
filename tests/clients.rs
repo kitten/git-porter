@@ -994,3 +994,122 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
     assert!(!sender.join(".local/share/git-porter").exists());
     assert!(!receiver.join(".local/share/git-porter").exists());
 }
+
+#[test]
+fn partial_clone_send_never_fetches_promised_objects_from_receiver() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let origin = root.join("origin");
+    let source = root.join("source.git");
+    let receiver = root.join("receiver.git");
+    let log = root.join("ssh.log");
+    let ssh = root.join("ssh");
+    let command = |program: &str, directory: &Path| {
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .current_dir(directory)
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_DIRS",
+            "XDG_DATA_DIRS",
+        ] {
+            command.env(name, root.join(name));
+        }
+        command
+    };
+    let git = |directory: &Path, args: &[&str]| {
+        let output = command("git", directory).args(args).output().unwrap();
+        assert_ok(output.clone());
+        output
+    };
+    fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "-q"]);
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+    fs::write(origin.join("file"), "promised blob\n").unwrap();
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-qm", "fixture"]);
+    git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+    let url = format!("file://{}", origin.display());
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            &url,
+            source.to_str().unwrap(),
+        ],
+    );
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            origin.to_str().unwrap(),
+            receiver.to_str().unwrap(),
+        ],
+    );
+    git(&receiver, &["update-ref", "-d", "refs/heads/topic"]);
+    // The receiver has the missing blob but must never serve a promisor fetch.
+    git(
+        &source,
+        &["config", "remote.origin.url", "git@promisor.invalid:origin"],
+    );
+    fs::write(&ssh, format!(
+        "#!/bin/sh\nfor arg do remote=$arg; done\nprintf '%s\\n' \"$remote\" >> {}\nexec /bin/sh -c \"$remote\"\n",
+        quote(&log)
+    )).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let send = || {
+        command(env!("CARGO_BIN_EXE_git-send"), &source)
+            .env("GIT_SSH_COMMAND", &ssh)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_NO_LAZY_FETCH", "0")
+            .args(["--local-only", &format!("fixture:{}", receiver.display())])
+            .output()
+            .unwrap()
+    };
+    let failed = send();
+    assert!(
+        !failed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let diagnostics = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        diagnostics.contains("lazy fetching disabled"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("filtering not recognized"),
+        "{diagnostics}"
+    );
+    assert!(!fs::read_to_string(&log).unwrap().contains("upload-pack"));
+    assert!(git(&receiver, &["for-each-ref"]).stdout.is_empty());
+    // Hydration uses the normal repository transport, outside the Porter helper.
+    git(&source, &["config", "remote.origin.url", &url]);
+    git(&source, &["cat-file", "blob", "HEAD:file"]);
+    git(
+        &source,
+        &["config", "remote.origin.url", "git@promisor.invalid:origin"],
+    );
+    assert_ok(send());
+    assert_eq!(
+        git(&receiver, &["rev-parse", "refs/heads/topic"]).stdout,
+        git(&source, &["rev-parse", "HEAD"]).stdout
+    );
+    assert!(!fs::read_to_string(&log).unwrap().contains("upload-pack"));
+}
