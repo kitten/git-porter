@@ -45,17 +45,22 @@ pub(super) fn run(config: &crate::server::config::ServerConfig) -> Result<()> {
             );
         }
         let publication = payload == b"publish-v5";
+        let read_session = payload == b"read-v1";
         result_channel = publication;
-        let signing = publication && !config.publication.skip_wrapped_key;
+        let signing = (publication || read_session) && !config.publication.skip_wrapped_key;
 
-        if !publication && payload != b"local-v1" {
+        if !publication && !read_session && payload != b"local-v1" {
             return Err("unsupported session capabilities".into());
         }
 
         outgoing.write(
             &mut output,
             Kind::Hello,
-            if publication && !signing {
+            if read_session && !signing {
+                b"read-account-v1"
+            } else if read_session {
+                b"read-v1"
+            } else if publication && !signing {
                 b"publish-account-v3"
             } else if publication {
                 b"publish-v5"
@@ -71,6 +76,7 @@ pub(super) fn run(config: &crate::server::config::ServerConfig) -> Result<()> {
             request,
             hint,
             mode,
+            read,
         } = Intent::parse(&payload, publication)?;
         if let Some(Update { reference, sha, .. }) = request
             && push_result::reference(reference)
@@ -92,6 +98,76 @@ pub(super) fn run(config: &crate::server::config::ServerConfig) -> Result<()> {
             std::str::from_utf8(origin)?,
             hint,
         )?;
+        if read_session != read.is_some() {
+            return Err("read capability requires a read intent".into());
+        }
+        if let Some(reference) = read {
+            crate::runtime::read::validate_reference(access.git(), reference, &session)?;
+            let upstream = super::read::origin(&access, &repository, &session)?;
+            if let Some(upstream) = upstream.as_ref().filter(|u| u.network) {
+                config.publication.allows(&upstream.url).map_err(|e| {
+                    format!(
+                        "{e}; use --local-only to receive existing refs without upstream access"
+                    )
+                })?;
+            }
+            let needs_signing = signing && upstream.as_ref().is_some_and(|u| u.network);
+            outgoing.write(
+                &mut output,
+                Kind::Resolved,
+                &serde_json::to_vec(&push_result::Resolved {
+                    version: 1,
+                    repository: repository.to_str().ok_or("non-UTF8 repository")?.into(),
+                    publication: false,
+                    signing: needs_signing,
+                })?,
+            )?;
+            let private = if needs_signing {
+                resources.bundle_lock =
+                    Some(crate::credentials::keys::Lock::acquire(&config.data)?);
+                let policy = config.publication.ready()?;
+                let approval = crate::credentials::derivation::Approval::new(
+                    repository.to_str().ok_or("non-UTF8 repository")?,
+                    &upstream.as_ref().ok_or("missing origin")?.url,
+                    reference,
+                    "",
+                    "read",
+                    "",
+                )?;
+                Some(signing::unlock(
+                    &policy,
+                    &mut report.reason,
+                    approval,
+                    |derive| {
+                        outgoing.write(&mut output, Kind::ApprovePublishV1, &derive.encode()?)?;
+                        crate::runtime::protocol::signature(&mut incoming, &mut input, &mut output)
+                    },
+                )?)
+            } else {
+                None
+            };
+            // Unlocking is complete. Keep the in-memory key, not the bundle
+            // lock, during network fetching and the client transfer.
+            drop(resources.bundle_lock.take());
+            input.reset(std::time::Duration::from_secs(1200));
+            output.reset(std::time::Duration::from_secs(1200));
+            let ready = || {
+                outgoing.write(&mut output, Kind::Ready, b"")?;
+                incoming.close();
+                outgoing.close();
+                Ok(())
+            };
+            return super::read::serve(
+                config,
+                &access,
+                &repository,
+                reference,
+                upstream,
+                private,
+                &session,
+                ready,
+            );
+        }
         report.repository = Some(
             repository
                 .to_str()

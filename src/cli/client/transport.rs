@@ -63,8 +63,12 @@ pub(crate) fn run() -> Result<()> {
     };
     let publication = operation == "receive"
         && std::env::var("GIT_PORTER_CLIENT_PUBLISH").is_ok_and(|s| s == "true");
-    let mut signing = publication;
-    let capability = if publication {
+    let reading =
+        operation == "upload" && std::env::var("GIT_PORTER_CLIENT_READ").as_deref() == Ok("true");
+    let mut signing = publication || reading;
+    let capability = if reading {
+        b"read-v1".as_slice()
+    } else if publication {
         b"publish-v5".as_slice()
     } else {
         b"local-v1".as_slice()
@@ -74,10 +78,10 @@ pub(crate) fn run() -> Result<()> {
     let force = std::env::var("GIT_PORTER_CLIENT_MODE").as_deref() == Ok("force");
     let lease_mode = std::env::var("GIT_PORTER_CLIENT_MODE").as_deref() == Ok("lease");
     let lease = operation == "receive" && lease_mode;
-    if !explicit.is_empty() && !publication && !force && !lease_mode {
+    if !explicit.is_empty() && !publication && !reading && !force && !lease_mode {
         return native(&destination, &explicit, operation);
     }
-    if publication {
+    if publication || reading {
         crate::runtime::supervision::disable_core_dumps()?;
         // Reserve the operation before connecting, so malformed negotiation or
         // a reconnect cannot obtain a fresh signing allowance in another helper.
@@ -95,7 +99,16 @@ pub(crate) fn run() -> Result<()> {
         "false".into()
     } else {
         validate_path(&native_path)?;
-        format!("git-{operation}-pack '{native_path}'")
+        if reading {
+            format!(
+                "git-porter internal:read '{}' {}",
+                native_path,
+                crate::cli::ssh::quoted_path(Path::new(&std::env::var("GIT_PORTER_CLIENT_REF")?))
+                    .to_string_lossy()
+            )
+        } else {
+            format!("git-{operation}-pack '{native_path}'")
+        }
     };
     let routed_command = format!(
         "{}{native_command}",
@@ -160,12 +173,20 @@ pub(crate) fn run() -> Result<()> {
                 &mut outgoing,
             )?;
 
-            if publication && hello == b"publish-account-v3" {
+            if publication && hello == b"publish-account-v3"
+                || reading && hello == b"read-account-v1"
+            {
                 signing = false;
             } else if hello != capability {
                 return Err("receiver does not support the requested capability".into());
             }
             let mut intent = format!("{operation}\0{explicit}\0{origin}");
+            if reading {
+                intent = format!(
+                    "read-v1\0{explicit}\0{origin}\0{}",
+                    std::env::var("GIT_PORTER_CLIENT_REF")?
+                );
+            }
             if force && !publication {
                 intent.push_str("\0force-v1");
             }
@@ -194,6 +215,21 @@ pub(crate) fn run() -> Result<()> {
             let resolved = control(&mut reader, &mut incoming, Kind::Resolved)?;
 
             let mut resolved_repository = None;
+            if reading {
+                let value: crate::runtime::push_result::Resolved =
+                    serde_json::from_slice(&resolved)?;
+                if value.version != 1
+                    || value.publication
+                    || value.signing && !signing
+                    || !value.repository.starts_with('/')
+                    || value.repository.len() > 4096
+                    || value.repository.chars().any(char::is_control)
+                {
+                    return Err("invalid resolved read metadata".into());
+                }
+                signing = value.signing;
+                resolved_repository = Some(value.repository);
+            }
             if publication {
                 let value: crate::runtime::push_result::Resolved =
                     serde_json::from_slice(&resolved)?;
@@ -245,7 +281,10 @@ pub(crate) fn run() -> Result<()> {
                 let response = match response {
                     Ok(response) => response,
                     Err(error) => {
-                        crate::cli::report_error("git-send", &error);
+                        crate::cli::report_error(
+                            if reading { "git-receive" } else { "git-send" },
+                            &error,
+                        );
                         outgoing.write(&mut writer, Kind::Error, b"signer-refused-v1")?;
                         return control(&mut reader, &mut incoming, Kind::Result)
                             .and_then(|_| Err("receiver did not report sender refusal".into()));
@@ -256,7 +295,9 @@ pub(crate) fn run() -> Result<()> {
                 outgoing.write(&mut writer, Kind::Signature, &response)?;
             }
             // Origin authentication is receiver work, not a stalled control peer.
-            let ready = if publication {
+            let ready = if reading {
+                wait_ready(&mut reader, &mut incoming, Duration::from_secs(1200))?
+            } else if publication {
                 wait_ready(&mut reader, &mut incoming, Duration::from_secs(150))?
             } else {
                 control(&mut reader, &mut incoming, Kind::Ready)?
@@ -297,7 +338,11 @@ pub(crate) fn run() -> Result<()> {
             );
         }
     }
-    result
+    if reading {
+        result.map_err(|error| format!("{error}. Automatic refresh needs a compatible receiver, a permitted upstream and working upstream credentials. Use git receive --local-only to read existing refs without refreshing").into())
+    } else {
+        result
+    }
 }
 
 fn wait_ready<T: std::io::Read + std::os::fd::AsRawFd>(

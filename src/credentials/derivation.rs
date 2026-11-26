@@ -186,9 +186,13 @@ impl Approval {
             || self.repository.len() > 4096
             || self.repository.chars().any(char::is_control)
             || self.reference.len() > 1024
-            || !reference(&self.reference)
-            || !oid(&self.sha)
-            || !matches!(self.mode.as_str(), "ff" | "force" | "lease")
+            || if self.mode == "read" {
+                !crate::runtime::push_result::read_reference(&self.reference)
+                    || !self.sha.is_empty()
+            } else {
+                !reference(&self.reference) || !oid(&self.sha)
+            }
+            || !matches!(self.mode.as_str(), "ff" | "force" | "lease" | "read")
             || self.mode == "lease" && !self.observed.is_empty() && !oid(&self.observed)
             || self.mode != "lease" && !self.observed.is_empty()
         {
@@ -257,7 +261,11 @@ impl PublishRequest {
         Self::new(current.source, current.metadata, approval)
     }
     pub fn approval_challenge(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"git-porter/v1/publish-approval\0".to_vec();
+        let mut bytes = if self.approval.mode == "read" {
+            b"git-porter/v1/read-approval\0".to_vec()
+        } else {
+            b"git-porter/v1/publish-approval\0".to_vec()
+        };
         bytes.extend(self.encode()?);
         Ok(bytes)
     }
@@ -455,6 +463,55 @@ mod tests {
             "",
         )
         .unwrap()
+    }
+    #[test]
+    fn read_approval_is_branch_bound_and_cannot_authorize_a_push() {
+        use super::{Approval, PublishRequest};
+        let (request, mut agent) = fixture();
+        let approval = Approval::new(
+            "/receiver/repo",
+            "git@github.com:org/repo",
+            "refs/heads/review/é+retry",
+            "",
+            "read",
+            "",
+        )
+        .unwrap();
+        let mut read = PublishRequest::new(request.source, request.metadata, approval).unwrap();
+        assert!(
+            read.approval_challenge()
+                .unwrap()
+                .starts_with(b"git-porter/v1/read-approval\0")
+        );
+        let response = read
+            .sign(&mut SigningBudget::default(), &mut agent)
+            .unwrap();
+        read.identity(&response).unwrap();
+        assert_eq!((agent.calls, agent.lists), (2, 1));
+        let destination = read.approval.destination.clone();
+        read.approval.destination = "git@github.com:other/repo".into();
+        assert!(read.identity(&response).is_err());
+        read.approval.destination = destination;
+        assert!(
+            read.approval
+                .matches_intent("/receiver/repo", "refs/heads/other", "", "read", "")
+                .is_err()
+        );
+        assert!(
+            read.approval
+                .matches_intent(
+                    "/receiver/repo",
+                    "refs/heads/review/é+retry",
+                    &"a".repeat(40),
+                    "ff",
+                    ""
+                )
+                .is_err()
+        );
+        read.approval.mode = "ff".into();
+        read.approval.reference = "refs/heads/review/retry".into();
+        read.approval.sha = "a".repeat(40);
+        assert!(read.identity(&response).is_err());
     }
     #[test]
     fn publication_approval_is_fresh_context_bound_and_domain_separated() {

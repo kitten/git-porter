@@ -13,9 +13,11 @@ Clients need no porter setup, generated credentials, shell edits, manual
 discovery prerequisite. Supply the receiver positionally or through
 porter.destination. Send requests publication unless --local-only; the receiver
 publishes only when the resolved repository has an origin push URL. No client
-publication setting exists. Receive is always unsigned and fast-forward only.
-Both clients accept --branch name with charset/check-ref-format validation and
-refusal of symbolic branches. Detached HEAD requires --branch. Send
+publication setting exists. Receive updates are fast-forward only; restricted upstream reads use the read
+approval below. Both clients accept --branch name and refuse symbolic destination
+branches; receive uses Git's ref grammar rather than send's ASCII restriction.
+Send from detached HEAD requires --branch; receive from detached HEAD requires
+--switch --branch. Send
 --force-with-lease observes the receiver's exact tip through unsigned ls-remote
 --refs, pushes with that explicit lease (empty means absent), and carries lease
 mode to onward publication. Do not refresh stale leases. A matching lease
@@ -52,8 +54,8 @@ raw Git bytes; Porter performs its existing bounded negotiation/signing/result
 exchange. Missing, malformed or failed markers never trigger fallback. Once the
 route is Porter, errors never retry native. Keep SSH forwarding/multiplexing off
 and normal user SSH identity selection. No GPG-agent-specific detection is needed.
-Explicit non-force/non-lease reads and local-only writes retain their direct
-native Git request path, including git-shell-only endpoints.
+Explicit --local-only reads and non-force/non-lease local-only writes retain
+their direct native Git request path, including git-shell-only endpoints.
 
 Record routed selection atomically in the private operation directory and require
 the same selection across lease observation and push, including explicit paths.
@@ -212,6 +214,128 @@ session. Receive into the current branch requires a clean worktree, fetches into
 a temporary ref, rechecks HEAD, merges --ff-only without autostash and removes
 the temp ref. Protect other checked-out worktrees and retain useful
 partial-success diagnostics.
+
+Receive accepts a short branch name validated by git check-ref-format, without
+send's ASCII-name restriction or receiver push-prefix restrictions. Wire parsing
+checks only branch namespace, length and control characters; Git owns the branch
+name grammar. Both read roles validate with git check-ref-format before origin
+authentication or preparation. Default receive
+asks the serving account to fetch that branch before advertising the requested branch.
+Refresh only the selected checkout's origin, using the requested branch name.
+This matches send's publication destination. Repository discovery and its remote
+identity matching remain unchanged; explicit host:path selects a checkout whose
+origin is used in the same way. Ignore branch.<name>.remote, branch.<name>.merge,
+upstream and other remotes for read refresh. Require exactly one origin fetch URL;
+a promisor-only origin section is not a configured fetch destination. Do not
+search another remote when the branch is absent or origin fails. Complete
+unpublished local history remains receivable. With no origin, serve only a
+complete local graph, even when other remotes are configured. Serve existing local
+objects directly; do not fetch from the checkout as a synthetic file remote. Check closure in the isolated object view,
+where operator shallow boundaries, grafts and replacement refs cannot hide missing
+history. If that graph is incomplete without origin, report the missing source;
+retrying alone cannot repair it. Restricted reads
+validate origin against the existing destination policy.
+Both SSH routes share origin lookup, local-tip resolution, explicit fetching and
+object hydration. Credential setup, transport environments and repository
+confinement remain route-specific.
+
+Use the operator repository as the object store. Default receive may download
+objects and update refs/remotes/origin/<branch> to the fetched origin tip, including
+when no local head exists. Do not move local branches, change working files or
+rewrite repository configuration. Use --no-deref for the tracking-ref update so
+an unexpected symbolic tracking ref cannot redirect the update into a local head.
+Disable reference hooks for that bookkeeping update. Preserve the fetched origin
+tip in the tracking ref even when complete local-ahead history is selected for
+transfer.
+
+Do not create a Porter object cache, retention refs, transfer clones, snapshots,
+hard links, maintenance schedule or cache lock. Normal Git object/ref locking and
+collection apply. Receive does not promise to survive arbitrary external object
+deletion or forced collection of unreferenced history during upload.
+
+Use an ordinary private temporary directory for Git configuration, the single
+advertised ref, transport/trust helpers and a missing-ID spool. It has no separate
+object store: GIT_OBJECT_DIRECTORY points directly to the operator objects for
+initialization, fetch, validation and upload. The temporary Git metadata prevents
+source-configured SSH commands, URL rewrites, hooks, filters, shallow boundaries,
+grafts and replacement refs from redirecting approved upstream access or hiding
+missing history. Remove it when the operation ends. Source Git commands are used
+only for metadata lookup and the origin-tracking update, never upstream fetching.
+
+A partial clone can negotiate from a commit whose reachable objects are missing.
+Only verified complete roots may seed fetch negotiation: the local requested
+branch, its origin-tracking tip and the operator HEAD. If none is complete, stream
+existing origin-tracking tips and use the first complete sibling history. This
+avoids repeated full downloads while HEAD remains incomplete. Validate roots
+incrementally and disable implicit alternate-ref negotiation. With no complete seed, refetch
+without filters. After incremental fetch, check closure and perform one full
+refetch if needed before explicit missing-ID hydration. This reuses operator
+objects across receives and related branches without another cache.
+
+Accept historical formats accepted by ordinary Git fetch. Restricted fetches
+set fetch.fsckObjects=false to override the shared write-side check; publication
+and receive-pack retain their existing validation policy. Boolean closure checks
+use Git's quiet missing-object error mode; stream missing IDs to disk only when
+hydration needs them. Never capture a whole graph through the bounded output
+helper. Missing objects are fetched explicitly into the operator store, with lazy
+fetch disabled throughout. Before advertisement, verify the complete selected
+graph, drop owned credentials, send READY and upload with a fresh credential-free
+command using the same operator objects and the isolated advertised ref.
+
+If a local head is ahead of upstream and its entire graph is complete, retain it; otherwise serve upstream,
+including when the histories diverge. An unpublished local head remains
+receivable when upstream advertises no such branch. Verify the complete selected
+object graph, streaming missing IDs into one explicit fetch per walk round, with
+at most eight rounds. Do not open one connection per small batch of missing IDs.
+Local-tip resolution also disables lazy fetching and treats unavailable
+local commits as unusable hints. Lazy fetching stays disabled throughout; missing objects or authentication
+failures stop the read before advertisement. Authentication has a 120-second
+allowance; bulk fetching/hydration uses the enclosing 1200-second session ceiling.
+
+By default receive pulls the selected remote branch into the current local branch,
+which can have a different name. --branch selects the source, not the destination.
+When the selected source name matches the current branch, plain receive updates
+that branch and its checkout, preserving the original same-name behavior; no
+explicit --switch is required. --switch selects the matching named local branch
+when it differs from the current branch and checks it out after successful
+receipt. Never force either branch updates or checkout; protect
+branches in other worktrees and preserve tracked, untracked and ignored files
+when switching. A checkout failure reports that the branch was received but HEAD
+did not switch. Detached HEAD is accepted only with --switch and an explicit
+branch. Both modes retain FETCH_HEAD on fast-forward failure.
+
+Restricted default reads negotiate read-v1. SSH upstreams use the existing wrapped
+key via a fresh read-specific approval, or the explicit account-agent mode. Release
+the credential-bundle lock as soon as unlocking completes, before fetching or
+serving data. Approve the single origin SSH destination with one read signing budget and
+one host-bound credential agent. Move the unlocked key into that agent, with no
+extra handler-owned clone. After preparation returns, drop the owned agent before
+READY and invoke upload using a fresh credential-free command. Raw upload-pack has no
+upstream SSH helper or credential socket in its environment. With no configured origin, serve an existing
+complete local graph without unlocking credentials; refuse missing/incomplete
+graphs. Local-path upstreams can refresh through file transport without credentials,
+but must first pass the same repository and metadata confinement checks as an
+explicit read, including canonical paths and rejection of alternates. Unsupported
+network credential/protocol modes fail with a --local-only hint; do not inherit
+ambient credentials or silently fall back after authentication failure. This grants no
+push permission, default-branch exemption or checked-out-branch update. Ordinary
+SSH runs the installed git-porter internal read role with the logged-in account's
+selected transport and the same hydration algorithm. Open the selected repository
+exactly, without searching parent directories. Only an actual origin fetch URL enables refresh; promisor/filter defaults alone
+cannot create a destination. Automatic refresh requires a
+compatible read role at the endpoint, including explicit host:path selections. Git-shell-only and older endpoints cannot run this
+helper: report --local-only as the explicit way to read existing refs without
+refreshing. Never retry a failed refresh/negotiation as a local-only read.
+
+Receive --local-only skips upstream fetching and credential unlocking. Prefer an
+existing refs/heads branch, then one cached refs/remotes/<remote>/<branch> source
+(with a single-component remote name); refuse ambiguous matches. These refs need
+not be checked out. Narrow the advertisement query by branch and stream all
+returned rows, retaining only the exact head, one tracking candidate and an
+ambiguity flag. Large or suffix-matching advertisements cannot consume the
+bounded metadata capture buffer. It performs only local object reads on the serving account;
+a partial clone missing required objects fails instead of contacting upstream.
+This differs from send --local-only, which suppresses onward publication.
 
 ## Client SSH
 

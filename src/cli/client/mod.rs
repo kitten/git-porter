@@ -4,6 +4,7 @@ use crate::Result;
 use std::process::Command;
 mod hydration;
 pub(crate) mod provision;
+pub(crate) mod read;
 mod repository;
 mod signing;
 pub(crate) mod transport;
@@ -29,10 +30,16 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
     let mut unconditional = false;
     let mut destination = None;
     let mut publish = true;
+    let mut local_only = false;
     let mut quiet = false;
+    let mut switch = false;
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
-            "--local-only" if !receive => publish = false,
+            "--local-only" => {
+                publish = false;
+                local_only = true;
+            }
+            "--switch" if receive => switch = true,
             "--quiet" if !receive => quiet = true,
             "--force-with-lease" if !receive => force = true,
             "--force" if !receive => unconditional = true,
@@ -49,14 +56,14 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
                     "Usage: git {} {}[--branch name] [user@host]",
                     if receive { "receive" } else { "send" },
                     if receive {
-                        ""
+                        "[--local-only] [--switch] "
                     } else {
                         "[--quiet] [--local-only] [--force-with-lease|--force] "
                     }
                 );
                 if receive {
                     println!(
-                        "\nFetch a receiver branch and fast-forward your local branch.\n\n  --branch <name>  Receive this branch instead of the current branch."
+                        "\nFetch a receiver branch and fast-forward your local branch.\n\n  --branch <name>  Pull this remote branch into the current branch.\n  --switch         Receive into the named local branch and switch to it.\n  --local-only     Skip upstream fetching."
                     );
                 } else {
                     println!(
@@ -100,16 +107,24 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
         })
         .ok_or("Detached HEAD; select a branch with --branch <name>")?;
     let reference = format!("refs/heads/{branch}");
-    if !reference
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"@._/-".contains(&b))
+    if !receive
+        && !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@._/-".contains(&b))
     {
         return Err("unsupported branch name; select a valid branch with --branch <name>, or rename it with git branch -m <name>. Branch names must use ASCII letters, digits or @._/- and pass git check-ref-format".into());
     }
     repository.output(&["check-ref-format", &reference])?;
+    let target = if receive && !switch {
+        current
+            .clone()
+            .ok_or("Detached HEAD; use --switch --branch <name> to receive a branch")?
+    } else {
+        reference.clone()
+    };
     if repository
         .command()
-        .args(["symbolic-ref", "--quiet", &reference])
+        .args(["symbolic-ref", "--quiet", &target])
         .output()?
         .status
         .code()
@@ -202,6 +217,7 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
             .env("GIT_PORTER_NATIVE_PATH", &native_path)
             .env("GIT_PORTER_ROUTE_FILE", &route_file)
             .env("GIT_PORTER_LOOKUP_ERROR", &lookup_error)
+            .env("GIT_PORTER_CLIENT_READ", "false")
             .env("GIT_PORTER_CLIENT_MODE", "ff")
             .env("GIT_PORTER_CLIENT_LEASE", "")
             .env("GIT_PORTER_CLIENT_HINT", &hint)
@@ -328,7 +344,21 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
         }
         return Ok(());
     }
+    let source = if local_only {
+        let mut observe = make();
+        observe.args(["ls-remote", "--refs", remote, &branch]);
+        local_read_source(observe, &reference, &session)?
+    } else {
+        reference.clone()
+    };
     let mut fetch = make();
+    if !local_only {
+        fetch
+            .env("GIT_PORTER_CLIENT_READ", "true")
+            .env("GIT_PORTER_CLIENT_MODE", "read")
+            .env("GIT_PORTER_CLIENT_REF", &reference)
+            .env("GIT_PORTER_CLIENT_SHA", "");
+    }
     fetch.args([
         "-c",
         "fetch.prune=false",
@@ -339,7 +369,7 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
         "--no-recurse-submodules",
         "--refmap=",
     ]);
-    if current.as_deref() == Some(&reference) {
+    let result = if current.as_deref() == Some(&target) {
         if !repository
             .output(&[
                 "status",
@@ -358,9 +388,7 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
             repository: &repository,
             reference: temporary_ref.clone(),
         };
-        fetch
-            .arg(remote)
-            .arg(format!("+{reference}:{temporary_ref}"));
+        fetch.arg(remote).arg(format!("+{source}:{temporary_ref}"));
         git_status(&session, fetch)?;
         let fetched = repository.output(&[
             "rev-parse",
@@ -371,24 +399,46 @@ pub fn run_arguments(receive: bool, supplied: Vec<String>) -> Result<()> {
             .output(&["symbolic-ref", "--quiet", "HEAD"])
             .ok()
             .as_deref()
-            != Some(&reference)
+            != Some(&target)
         {
             return Err(
                 "Current branch changed during fetch; fetched history remains in FETCH_HEAD. Switch back before retrying".into(),
             );
         }
         let mut merge = repository.command();
-        merge.args(["merge", "--ff-only", "--no-autostash", &fetched]);
+        merge.args([
+            "merge",
+            "--ff-only",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            &fetched,
+        ]);
         let result = git_status(&session, merge).map_err(|e| -> Box<dyn std::error::Error> {
-            format!("{e}. Could not fast-forward {reference} from {host}. Fetched history remains in FETCH_HEAD; inspect it with: git log --left-right --graph {reference}...FETCH_HEAD").into()
+            format!("{e}. Could not fast-forward {target} from {host}. Fetched history remains in FETCH_HEAD; inspect it with: git log --left-right --graph {target}...FETCH_HEAD").into()
         });
         drop(cleanup);
         result
     } else {
-        fetch.arg(remote).arg(format!("{reference}:{reference}"));
-        git_status(&session, fetch).map_err(|e|format!("{e}. Could not receive {reference} from {host}. Resolve the fetch error above; if histories diverged, inspect FETCH_HEAD before merging or rebasing.").into())
+        fetch.arg(remote).arg(format!("{source}:{target}"));
+        git_status(&session, fetch).map_err(|e|format!("{e}. Could not receive {target} from {host}. Resolve the fetch error above; if histories diverged, inspect FETCH_HEAD before merging or rebasing.").into())
+    };
+    result?;
+    if switch && current.as_deref() != Some(&target) {
+        let mut checkout = repository.command();
+        checkout.args([
+            "switch",
+            "--no-guess",
+            "--no-overwrite-ignore",
+            "--",
+            &branch,
+        ]);
+        git_status(&session, checkout).map_err(|e| -> Box<dyn std::error::Error> {
+            format!("{e}. Received {target}, but could not switch; inspect your worktree before retrying git switch").into()
+        })?;
     }
+    Ok(())
 }
+
 struct RefCleanup<'a> {
     repository: &'a Repository,
     reference: String,
@@ -414,4 +464,55 @@ fn destination_host(value: &str) -> Result<()> {
         return Err("expected hostname or user@hostname".into());
     }
     Ok(())
+}
+
+fn local_read_source(
+    command: Command,
+    reference: &str,
+    session: &crate::runtime::supervision::Session,
+) -> Result<String> {
+    let branch = reference
+        .strip_prefix("refs/heads/")
+        .ok_or("expected branch")?;
+    let (status, (head, candidate, ambiguous)) = crate::runtime::git_output::lines(
+        command,
+        session,
+        (false, None::<String>, false),
+        |(head, candidate, ambiguous), row| {
+            let text = std::str::from_utf8(row).map_err(std::io::Error::other)?;
+            let (oid, name) = text
+                .split_once('\t')
+                .ok_or_else(|| std::io::Error::other("invalid ref advertisement"))?;
+            if !crate::runtime::push_result::oid(oid) {
+                return Err(std::io::Error::other("invalid object ID"));
+            }
+            if name == reference {
+                *head = true;
+            }
+            if name
+                .strip_prefix("refs/remotes/")
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(_, name)| name == branch)
+            {
+                if candidate.is_some() {
+                    *ambiguous = true;
+                } else {
+                    *candidate = Some(name.to_owned());
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if !status.success() {
+        return Err("cannot observe receiver branches".into());
+    }
+    if head {
+        return Ok(reference.into());
+    }
+    if ambiguous {
+        return Err("multiple cached receiver branches match; retry without --local-only".into());
+    }
+    candidate.ok_or_else(|| {
+        "branch is unavailable locally on receiver; retry without --local-only".into()
+    })
 }

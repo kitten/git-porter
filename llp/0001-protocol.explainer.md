@@ -78,6 +78,26 @@ The already-up-to-date inline publication starts after READY, under native-phase
 supervision, so its origin query/push cannot consume the READY allowance.
 Signing pauses never extend the enclosing 1200-second session ceiling.
 
+Default receive negotiates read-v1 (read-account-v1 in explicit account-agent
+mode) with the bounded intent read-v1, path, identities and refs/heads branch,
+plus the optional path hint. Ref fields have bounded branch-namespace/control
+checks on the wire; Git validates branch-name grammar before approval. A read intent is accepted only with its read
+capability. RESOLVED uses the versioned resolved metadata shape with the authorized
+repository, publication=false, and signing set only for a wrapped SSH upstream.
+A local-only/no-upstream preparation can therefore proceed to READY without any
+unlock/signing exchange. The client rejects publication metadata or signing in
+account-agent mode. Wrapped reads use the same two-signature unlock exchange but approval mode read, empty new/observed OIDs,
+and the separate git-porter/v1/read-approval domain. Bind the canonical repository,
+single origin destination, requested branch and nonce. Check that destination
+against receiver policy before approval. No read fallback destination list is
+encoded or authorized. Read approvals cannot
+match publication intents, and publication never accepts read mode. The client
+reserves one signing allowance before connecting. Preparation returns only after
+explicit origin hydration and closure validation in the operator object store; the handler then drops its owned credential
+agent, sends READY and starts raw upload-pack as a separate phase.
+No publication result envelope or onward push is involved. Allow read preparation
+to use the existing enclosing 1200-second session ceiling; retain a separate 120-second upstream authentication allowance.
+
 ## Signing
 
 Each default wrapped-key publication has one bounded typed exchange containing

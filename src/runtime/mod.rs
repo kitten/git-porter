@@ -7,3 +7,7 @@ pub mod supervision;
 pub mod push_result;
 
 pub(crate) mod ssh_wire;
+
+pub(crate) mod read;
+
+pub(crate) mod git_output;

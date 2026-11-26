@@ -39,6 +39,7 @@ pub(super) struct Intent<'a> {
     pub(super) request: Option<Update<'a>>,
     pub(super) hint: Option<&'a str>,
     pub(super) mode: Mode,
+    pub(super) read: Option<&'a str>,
 }
 impl<'a> Intent<'a> {
     pub(super) fn parse(payload: &'a [u8], publication: bool) -> Result<Self> {
@@ -49,6 +50,18 @@ impl<'a> Intent<'a> {
             crate::runtime::protocol::relative_hint(value)?;
             hint = Some(value);
             fields.truncate(fields.len() - 2);
+        }
+        let mut read = None;
+        if let [b"read-v1", path, origin, reference] = fields.as_slice() {
+            if publication {
+                return Err("read cannot publish".into());
+            }
+            let reference = std::str::from_utf8(reference)?;
+            if !crate::runtime::push_result::read_reference(reference) {
+                return Err("invalid read reference".into());
+            }
+            read = Some(reference);
+            fields = vec![b"upload".as_slice(), *path, *origin];
         }
         let (operation, path, origin, mode, request) = match fields.as_slice() {
             [op, path, origin] if !publication => (*op, *path, *origin, Mode::Ff, None),
@@ -90,12 +103,28 @@ impl<'a> Intent<'a> {
             mode,
             request,
             hint,
+            read,
         })
     }
 }
 #[cfg(test)]
 mod intent_tests {
     use super::*;
+    #[test]
+    fn read_intent_never_grants_write_modes() {
+        let read = Intent::parse(b"read-v1\0repo\0\0refs/heads/topic", false).unwrap();
+        assert_eq!(read.operation, b"upload");
+        assert!(read.request.is_none());
+        assert!(Intent::parse(b"read-v1\0repo\0\0refs/heads/topic", true).is_err());
+        assert!(Intent::parse(b"read-v1\0repo\0\0refs/tags/topic", false).is_err());
+        assert!(
+            Intent::parse(
+                b"intent-v2\0receive\0repo\0\0read\0refs/heads/topic\0\0",
+                true
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn force_is_only_granted_by_its_matched_shape() {
         assert!(Intent::parse(b"receive\0repo\0force-v1", false).is_err());

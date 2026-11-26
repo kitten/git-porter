@@ -156,6 +156,14 @@ pub(crate) fn direct_branch(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"@._/-".contains(&b))
 }
+/// Wire bounds only; Git validates branch-name grammar before read preparation.
+pub fn read_reference(value: &str) -> bool {
+    value.len() <= 1024
+        && value
+            .strip_prefix("refs/heads/")
+            .is_some_and(|branch| !branch.is_empty())
+        && !value.bytes().any(|c| c < 0x20 || c == 0x7f)
+}
 pub fn reference(value: &str) -> bool {
     text(value, 1024) && direct_branch(value)
 }

@@ -85,8 +85,17 @@ owner-only per-repo lock under the receiver data directory (keyed by common Git
 directory, so linked worktrees share it) and retain native Git old-OID checks.
 Read-only upload-pack sessions may run concurrently with a writer, including
 nested promisor hydration; Git advertises committed refs/objects while
-quarantine remains private. Read access need not create files inside a read-only
-repository. If origin accepts but the local update subsequently fails, report
+quarantine remains private. Raw read access need not create files inside a read-only
+repository. Default receive, after repository authorization, may explicitly fetch
+origin objects and update its remote-tracking ref; local branches, working files
+and repository config remain unchanged. Origin fetching uses the same destination
+and credential policy as publication; other remotes cannot redirect a read.
+Confine local-file origins with the same access checks; no-origin reads require
+an existing complete graph. Use temporary transport/ref metadata over the operator
+object store rather than a private object cache. Release the bundle lock after
+unlocking a read key, and drop owned read credentials before native upload.
+Its separate read approval permits only this fetch bookkeeping, not pushes or
+arbitrary branch writes; see [read preparation](0002-clients.explainer.md#local-only-transport). If origin accepts but the local update subsequently fails, report
 the receiver failure and rechecked origin state. Observed commit presence
 establishes no causation. After any failed publication or receiver update,
 re-read origin through the same isolated transport and the transaction’s

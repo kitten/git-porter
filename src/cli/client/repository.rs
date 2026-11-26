@@ -11,6 +11,28 @@ pub(super) struct Repository {
     work_tree: Option<String>,
 }
 impl Repository {
+    pub(super) fn open(path: &Path) -> Result<Self> {
+        let repo = git2::Repository::open_ext(
+            path,
+            git2::RepositoryOpenFlags::NO_SEARCH,
+            std::iter::empty::<&Path>(),
+        )?;
+        let git_dir = repo
+            .path()
+            .canonicalize()?
+            .to_str()
+            .ok_or("repository path must be UTF-8")?
+            .to_owned();
+        let work_tree = repo
+            .workdir()
+            .map(|path| {
+                path.to_str()
+                    .map(str::to_owned)
+                    .ok_or("worktree path must be UTF-8")
+            })
+            .transpose()?;
+        Ok(Self { git_dir, work_tree })
+    }
     pub(super) fn discover() -> Result<Self> {
         let git_dir = raw_git_output(&["rev-parse", "--path-format=absolute", "--git-dir"])?;
         let work_tree = if raw_git_output(&["rev-parse", "--is-bare-repository"])? == "true" {

@@ -1,3 +1,5 @@
+#[path = "support/source_agent.rs"]
+mod source_agent;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
@@ -133,8 +135,9 @@ fn installed_clients_discover_send_receive_and_preserve_worktree_and_ref_policy(
     fs::create_dir(&temporary).unwrap();
     let run = |binary: &str, extra: &[&str]| {
         let mut command = Command::new(binary);
-        if binary.ends_with("git-send") {
-            command.arg("--local-only");
+        command.arg("--local-only");
+        if binary.ends_with("git-receive") && extra.contains(&"--branch") {
+            command.arg("--switch");
         }
         command
             .current_dir(&source)
@@ -219,6 +222,17 @@ fn installed_clients_discover_send_receive_and_preserve_worktree_and_ref_policy(
     assert_ok(run(
         env!("CARGO_BIN_EXE_git-receive"),
         &["--branch", "contributors/test"],
+    ));
+    let tip =
+        String::from_utf8(git(&destination, &["rev-parse", "refs/heads/contributors/test"]).stdout)
+            .unwrap();
+    assert_ok(git(
+        &destination,
+        &["update-ref", "refs/heads/review/é+retry", tip.trim()],
+    ));
+    assert_ok(run(
+        env!("CARGO_BIN_EXE_git-receive"),
+        &["--local-only", "--branch", "review/é+retry"],
     ));
     // An arbitrarily named secondary remote matches the receiver's origin when
     // the sender's origin is its own agent fork. Exercise both Git subcommands.
@@ -915,6 +929,9 @@ fn ordinary_ssh_uses_matching_home_paths_without_porter_policy_or_an_agent() {
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let run = |binary: &str, checkout: &Path, flags: &[&str]| {
         let mut command = Command::new(binary);
+        if binary.ends_with("git-receive") {
+            command.arg("--local-only");
+        }
         command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
@@ -2140,4 +2157,1747 @@ fn merged_shallow_promisors_supply_disjoint_roots_and_objects() {
     assert_eq!(fs::read(source.join("config")).unwrap(), config);
     assert!(!source.join("FETCH_HEAD").exists());
     assert!(!source.join("shallow").exists());
+}
+
+#[test]
+fn checked_out_partial_clone_still_needs_historical_blobs_for_upload() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let forge = root.join("forge");
+    let serving = root.join("serving");
+    let receiving = root.join("receiving");
+    fs::create_dir(&forge).unwrap();
+    let run = |directory: &Path, arguments: &[&str]| {
+        isolated_command("git", directory, root)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    assert_ok(run(&forge, &["init", "-q", "-b", "topic"]));
+    fs::write(forge.join("file"), "historical blob\n").unwrap();
+    assert_ok(run(&forge, &["add", "."]));
+    assert_ok(run(&forge, &["commit", "-qm", "historical"]));
+    let blob = String::from_utf8(run(&forge, &["rev-parse", "HEAD:file"]).stdout).unwrap();
+    fs::write(forge.join("file"), "current blob\n").unwrap();
+    assert_ok(run(&forge, &["commit", "-qam", "current"]));
+    assert_ok(run(&forge, &["config", "uploadpack.allowFilter", "true"]));
+    assert_ok(run(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &format!("file://{}", forge.display()),
+            serving.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(
+        fs::read_to_string(serving.join("file")).unwrap(),
+        "current blob\n"
+    );
+    assert!(
+        !run(
+            &serving,
+            &["--no-lazy-fetch", "cat-file", "-e", blob.trim()]
+        )
+        .status
+        .success()
+    );
+    assert_ok(run(root, &["init", "-q", receiving.to_str().unwrap()]));
+    let transfer = || {
+        isolated_command("git", &receiving, root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "fetch",
+                serving.to_str().unwrap(),
+                "refs/heads/topic:refs/heads/topic",
+            ])
+            .output()
+            .unwrap()
+    };
+    let failure = transfer();
+    assert!(!failure.status.success());
+    assert!(
+        String::from_utf8_lossy(&failure.stderr).contains("git-pack-objects died"),
+        "{}",
+        String::from_utf8_lossy(&failure.stderr)
+    );
+    // Explicit owner-side hydration uses the actual upstream, outside a pinned
+    // Porter transport. It changes objects only, with no persistent config edit.
+    assert_ok(run(
+        &serving,
+        &["fetch", "--no-write-fetch-head", "origin", blob.trim()],
+    ));
+    assert_ok(transfer());
+}
+
+#[test]
+fn authenticated_receive_refreshes_stale_partial_receiver_without_updating_its_checkout() {
+    use git_porter::credentials::wrapping;
+    use signature::Signer;
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let forge = root.join("forge");
+    let home = root.join("operator");
+    let client = root.join("client");
+    let serving = home.join("repo");
+    let bin = root.join("bin");
+    for path in [&forge, &home, &client, &bin] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let git = |path: &Path, args: &[&str]| {
+        isolated_command("git", path, &root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_ok(git(&forge, &["init", "-q", "-b", "topic"]));
+    fs::write(forge.join("file"), "historical\n").unwrap();
+    assert_ok(git(&forge, &["add", "."]));
+    assert_ok(git(&forge, &["commit", "-qm", "base"]));
+    fs::write(forge.join("file"), "checked out\n").unwrap();
+    assert_ok(git(&forge, &["commit", "-qam", "checked out tree"]));
+    assert_ok(git(&forge, &["config", "uploadpack.allowFilter", "true"]));
+    assert_ok(git(
+        &home,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &format!("file://{}", forge.display()),
+            serving.to_str().unwrap(),
+        ],
+    ));
+    let old = git(&serving, &["rev-parse", "HEAD"]).stdout;
+    fs::write(forge.join("file"), "latest\n").unwrap();
+    assert_ok(git(&forge, &["commit", "-qam", "latest"]));
+    let latest = git(&forge, &["rev-parse", "HEAD"]).stdout;
+    assert_ok(git(&forge, &["branch", "review/é+retry"]));
+    assert_ok(git(&forge, &["branch", "topic./sub"]));
+    assert_ok(git(
+        &serving,
+        &["remote", "set-url", "origin", "git@github.com:test/fixture"],
+    ));
+    assert_ok(git(&client, &["init", "-q", "-b", "topic"]));
+    let data = home.join(".local/share/git-porter");
+    fs::create_dir_all(data.join("transport")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_git-porter"), data.join("transport/ssh"))
+        .unwrap();
+    let source =
+        ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let key =
+        ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let metadata = wrapping::Metadata::generate(source.public_key()).unwrap();
+    let signature: ssh_key::Signature = source
+        .try_sign(&metadata.challenge(source.public_key()).unwrap())
+        .unwrap();
+    let identity = metadata
+        .from_signature(source.public_key(), &signature)
+        .unwrap();
+    let bundle = wrapping::Bundle {
+        metadata,
+        ciphertext: age::encrypt(
+            &identity.to_public(),
+            key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap(),
+    };
+    bundle
+        .write(fs::File::create(data.join("publication.wrapped")).unwrap())
+        .unwrap();
+    fs::set_permissions(
+        data.join("publication.wrapped"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(
+        data.join("publication.pub"),
+        key.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        data.join("publication.source.pub"),
+        source.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        format!(
+            "[porter]\nsearchRoot = {}\nauthorizedKey = {}\n",
+            home.display(),
+            source.public_key().to_openssh().unwrap()
+        ),
+    )
+    .unwrap();
+    let agent = source_agent::Agent::start(source).unwrap();
+    let fork = root.join("fork.git");
+    let log = root.join("upstream-log");
+    let packet_trace = root.join("upstream-packets");
+    let hold = root.join("hold-upstream");
+    let started = root.join("upstream-started");
+    let reject = root.join("reject");
+    // Only upstream SSH reaches this fixture executable; incoming Git uses the
+    // separate forced-command wrapper below. No actual network or credentials.
+    fs::write(
+        bin.join("ssh"),
+        format!(
+            "#!/bin/sh\necho upstream >> {}\ntest ! -e {} || exit 1\nif test -e {}; then : > {}; while test -e {}; do sleep 0.01; done; fi\nfor arg do request=$arg; done\ncase \"$request\" in *test/fork*) GIT_TRACE_PACKET={} exec git-upload-pack {} ;; esac\nGIT_TRACE_PACKET={} exec git-upload-pack {}\n",
+            quote(&log),
+            quote(&reject),
+            quote(&hold), quote(&started), quote(&hold),
+            quote(&packet_trace), quote(&fork),
+            quote(&packet_trace),
+            quote(&forge)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let incoming = root.join("incoming-ssh");
+    fs::write(&incoming, format!("#!/bin/sh\nfor arg do SSH_ORIGINAL_COMMAND=$arg; done\nexport SSH_ORIGINAL_COMMAND\nexport HOME={}\nexport XDG_DATA_HOME={}\nexport XDG_CONFIG_HOME={}\nunset SSH_AUTH_SOCK\nexec {} internal:serve\n", quote(&home), quote(&home.join(".local/share")), quote(&home.join(".config")), quote(Path::new(env!("CARGO_BIN_EXE_git-porter"))))).unwrap();
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+    let real_git = git_porter::server::config::executable("git").unwrap();
+    let upload_environment_error = root.join("upload-environment-error");
+    fs::write(bin.join("git"), format!("#!/bin/sh\nfor arg do\nif test \"$arg\" = upload-pack; then\nif test -n \"${{GIT_SSH-}}${{GIT_SSH_COMMAND-}}${{GIT_PORTER_TRANSACTION_SOCKET-}}${{SSH_AUTH_SOCK-}}\"; then : > {}; exit 99; fi\nfi\ndone\nexec {} \"$@\"\n", quote(&upload_environment_error), quote(&real_git))).unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let remote_login = fs::read_to_string(&incoming).unwrap().replacen(
+        "\nexec ",
+        &format!("\nexport PATH={}\nexec ", quote(Path::new(&path))),
+        1,
+    );
+    fs::write(&incoming, remote_login).unwrap();
+    let receive = |branch: &str, local: bool| {
+        let mut cmd = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root);
+        cmd.env("PATH", &path)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_SSH_COMMAND", &incoming)
+            .env("SSH_AUTH_SOCK", agent.socket());
+        if local {
+            cmd.arg("--local-only");
+        }
+        cmd.arg("--switch")
+            .args([
+                "--branch",
+                branch,
+                &format!("operator:{}", serving.display()),
+            ])
+            .output()
+            .unwrap()
+    };
+    let receive_matching = |branch: Option<&str>| {
+        let mut cmd = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root);
+        cmd.env("PATH", &path)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_SSH_COMMAND", &incoming)
+            .env("SSH_AUTH_SOCK", agent.socket());
+        if let Some(branch) = branch {
+            cmd.args(["--branch", branch]);
+        }
+        cmd.arg(format!("operator:{}", serving.display()))
+            .output()
+            .unwrap()
+    };
+    assert!(!receive("topic", true).status.success());
+    assert!(
+        !git(&client, &["show-ref", "--verify", "refs/heads/topic"])
+            .status
+            .success()
+    );
+    assert!(!log.exists(), "local-only must not contact upstream");
+    // Matching branch names update both the branch and its checkout without
+    // requiring --switch, preserving main's existing behavior.
+    assert_ok(receive_matching(Some("topic")));
+    assert_eq!(
+        git(&client, &["symbolic-ref", "--short", "HEAD"]).stdout,
+        b"topic\n"
+    );
+    assert_eq!(fs::read_to_string(client.join("file")).unwrap(), "latest\n");
+    assert_eq!(git(&client, &["rev-parse", "topic"]).stdout, latest);
+    assert_eq!(git(&serving, &["rev-parse", "HEAD"]).stdout, old);
+    assert_eq!(
+        fs::read_to_string(serving.join("file")).unwrap(),
+        "checked out\n"
+    );
+    // Warm receives reuse the complete graph, while still checking upstream.
+    let cache_root = root.join("XDG_CACHE_HOME/git-porter/read-objects");
+    // The incoming wrapper keeps the isolated client's XDG cache directory.
+    let cache_bytes = |root: &Path| {
+        fn size(path: &Path) -> u64 {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        size(&path)
+                    } else if path.extension().is_some_and(|e| e == "pack") {
+                        fs::metadata(path).unwrap().len()
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+        size(root)
+    };
+    let wants = || {
+        fs::read_to_string(&packet_trace)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("want "))
+            .count()
+    };
+    let cold_wants = wants();
+    assert!(cold_wants > 0);
+    assert!(!cache_root.exists());
+    let cold_size = cache_bytes(&serving.join(".git/objects"));
+    assert!(cold_size > 0);
+    assert_ok(receive_matching(None));
+    assert_eq!(cache_bytes(&serving.join(".git/objects")), cold_size);
+    assert_eq!(
+        wants(),
+        cold_wants,
+        "warm receives must not request another pack"
+    );
+    fs::write(&hold, "").unwrap();
+    let mut slow = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root)
+        .env("PATH", &path)
+        .env("GIT_SSH_VARIANT", "ssh")
+        .env("GIT_SSH_COMMAND", &incoming)
+        .env("SSH_AUTH_SOCK", agent.socket())
+        .args([
+            "--branch",
+            "topic",
+            &format!("operator:{}", serving.display()),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !started.exists() {
+        if std::time::Instant::now() > deadline {
+            fs::remove_file(&hold).unwrap();
+            let _ = slow.kill();
+            let _ = slow.wait();
+            panic!("read did not reach upstream preparation");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let key_lock = git_porter::credentials::keys::Lock::acquire(&data);
+    let unlocked = key_lock.is_ok();
+    drop(key_lock);
+    fs::remove_file(&hold).unwrap();
+    assert_ok(slow.wait_with_output().unwrap());
+    assert!(
+        unlocked,
+        "read retained the credential bundle lock during network transfer"
+    );
+    assert_ok(receive("topic./sub", false));
+    assert_eq!(
+        git(&client, &["symbolic-ref", "--short", "HEAD"]).stdout,
+        b"topic./sub\n"
+    );
+    assert_ok(git(&client, &["switch", "-c", "renamed-local", "topic"]));
+    let pull = |source: &str| {
+        isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root)
+            .env("PATH", &path)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_SSH_COMMAND", &incoming)
+            .env("SSH_AUTH_SOCK", agent.socket())
+            .args([
+                "--branch",
+                source,
+                &format!("operator:{}", serving.display()),
+            ])
+            .output()
+            .unwrap()
+    };
+    assert_ok(pull("topic"));
+    assert_eq!(
+        git(&client, &["symbolic-ref", "--short", "HEAD"]).stdout,
+        b"renamed-local\n"
+    );
+    assert_ok(git(&forge, &["switch", "-c", "pull-source"]));
+    assert_ok(git(
+        &forge,
+        &["commit", "--allow-empty", "-qm", "pull source"],
+    ));
+    let pulled = git(&forge, &["rev-parse", "HEAD"]).stdout;
+    assert_ok(git(&forge, &["switch", "topic"]));
+    assert_ok(pull("pull-source"));
+    assert_eq!(git(&client, &["rev-parse", "renamed-local"]).stdout, pulled);
+    assert_eq!(git(&client, &["rev-parse", "topic"]).stdout, latest);
+    assert!(
+        !git(&client, &["show-ref", "--verify", "refs/heads/pull-source"])
+            .status
+            .success()
+    );
+    assert_ok(receive("pull-source", false));
+    assert_eq!(
+        git(&client, &["symbolic-ref", "--short", "HEAD"]).stdout,
+        b"pull-source\n"
+    );
+    assert_ok(git(&forge, &["switch", "-c", "collision", "pull-source"]));
+    fs::write(forge.join("protected-file"), "remote content").unwrap();
+    assert_ok(git(&forge, &["add", "."]));
+    assert_ok(git(&forge, &["commit", "-qm", "checkout conflict"]));
+    assert_ok(git(&forge, &["switch", "topic"]));
+    fs::write(client.join(".git/info/exclude"), "protected-file\n").unwrap();
+    fs::write(client.join("protected-file"), "local content").unwrap();
+    assert!(!pull("collision").status.success());
+    assert_eq!(git(&client, &["rev-parse", "HEAD"]).stdout, pulled);
+    assert_eq!(
+        fs::read_to_string(client.join("protected-file")).unwrap(),
+        "local content"
+    );
+    let conflict = receive("collision", false);
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("Received refs/heads/collision"));
+    assert_eq!(
+        fs::read_to_string(client.join("protected-file")).unwrap(),
+        "local content"
+    );
+    assert_eq!(
+        git(&client, &["symbolic-ref", "--short", "HEAD"]).stdout,
+        b"pull-source\n"
+    );
+    fs::remove_file(client.join("protected-file")).unwrap();
+    // A divergent operator head cannot block receiving the upstream branch.
+    assert_ok(git(
+        &serving,
+        &["commit", "--allow-empty", "-qm", "operator divergence"],
+    ));
+    assert_ok(receive("topic", false));
+    assert_eq!(git(&client, &["rev-parse", "topic"]).stdout, latest);
+    let historical = git(&forge, &["rev-parse", "topic~2:file"]).stdout;
+    assert_ok(git(
+        &serving,
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            &format!("file://{}", forge.display()),
+            std::str::from_utf8(&historical).unwrap().trim(),
+        ],
+    ));
+    assert_ok(git(
+        &serving,
+        &[
+            "update-ref",
+            "refs/remotes/origin/review/é+retry",
+            std::str::from_utf8(&old).unwrap().trim(),
+        ],
+    ));
+    assert_ok(receive("review/é+retry", true));
+    assert_eq!(git(&client, &["rev-parse", "review/é+retry"]).stdout, old);
+    assert_ok(git(
+        &serving,
+        &[
+            "update-ref",
+            "refs/remotes/another/review/é+retry",
+            std::str::from_utf8(&old).unwrap().trim(),
+        ],
+    ));
+    assert!(!receive("review/é+retry", true).status.success());
+    assert_ok(receive("review/é+retry", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "review/é+retry"]).stdout,
+        latest
+    );
+    assert!(
+        !git(
+            &serving,
+            &["show-ref", "--verify", "refs/heads/review/é+retry"]
+        )
+        .status
+        .success()
+    );
+    assert!(!receive("missing-branch", false).status.success());
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "unrelated", "git@github.com:other/repo"],
+    ));
+    assert_ok(git(
+        &serving,
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            "git@github.com:ambiguous/repo",
+        ],
+    ));
+    let before = fs::read_to_string(&log).unwrap();
+    assert!(!receive("topic", false).status.success());
+    assert_eq!(fs::read_to_string(&log).unwrap(), before);
+    assert_ok(git(
+        &serving,
+        &["config", "--unset-all", "remote.origin.url"],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "remote.origin.url", "git@github.com:test/fixture"],
+    ));
+    fs::write(&reject, "").unwrap();
+    assert!(!receive("topic", false).status.success());
+    assert_eq!(git(&client, &["rev-parse", "topic"]).stdout, latest);
+    fs::remove_file(&reject).unwrap();
+    assert_ok(git(&client, &["switch", "topic"]));
+    fs::write(client.join("local"), "local divergence").unwrap();
+    assert_ok(git(&client, &["add", "."]));
+    assert_ok(git(&client, &["commit", "-qm", "local"]));
+    let local = git(&client, &["rev-parse", "HEAD"]).stdout;
+    fs::write(forge.join("file"), "next\n").unwrap();
+    assert_ok(git(&forge, &["commit", "-qam", "next"]));
+    assert!(!receive("topic", false).status.success());
+    assert_eq!(git(&client, &["rev-parse", "HEAD"]).stdout, local);
+    // Explicit account-agent mode does not require a sender signing socket.
+    let policy = fs::read_to_string(home.join(".gitconfig")).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        format!("{policy}skipWrappedKey = true\n"),
+    )
+    .unwrap();
+    let wrapper = fs::read_to_string(&incoming).unwrap().replace(
+        "unset SSH_AUTH_SOCK",
+        &format!("export SSH_AUTH_SOCK={}", quote(&agent.socket())),
+    );
+    fs::write(&incoming, wrapper).unwrap();
+    let account_result = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root)
+        .env("PATH", &path)
+        .env("GIT_SSH_COMMAND", &incoming)
+        .env("GIT_SSH_VARIANT", "ssh")
+        .env("SSH_AUTH_SOCK", root.join("no-sender-agent"))
+        .args([
+            "--switch",
+            "--branch",
+            "review/é+retry",
+            &format!("operator:{}", serving.display()),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(account_result);
+    // Ordinary SSH uses the same origin hydration algorithm with the operator's
+    // selected SSH transport, without Porter policy or credential derivation.
+    let native_client = root.join("native-client");
+    fs::create_dir(&native_client).unwrap();
+    assert_ok(git(&native_client, &["init", "-q", "-b", "topic"]));
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_git-porter"), bin.join("git-porter")).unwrap();
+    assert_ok(git(
+        &serving,
+        &[
+            "config",
+            "core.sshCommand",
+            bin.join("ssh").to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&serving, &["config", "ssh.variant", "ssh"]));
+    let native_ssh = root.join("native-ssh");
+    fs::write(&native_ssh, format!("#!/bin/sh\nfor arg do remote=$arg; done\nexport HOME={}\nunset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT\nexec /bin/sh -c \"$remote\"\n", quote(&home))).unwrap();
+    fs::set_permissions(&native_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let native_result = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &native_client, &root)
+        .env("PATH", &path)
+        .env("GIT_SSH_COMMAND", &native_ssh)
+        .env("GIT_SSH_VARIANT", "ssh")
+        .args([
+            "--branch",
+            "topic",
+            &format!("operator:{}", serving.display()),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(native_result);
+    assert_eq!(
+        git(&native_client, &["rev-parse", "topic"]).stdout,
+        git(&forge, &["rev-parse", "topic"]).stdout
+    );
+    assert_ok(git(&serving, &["branch", "unpublished-local"]));
+    assert_ok(receive("unpublished-local", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        git(&serving, &["rev-parse", "unpublished-local"]).stdout
+    );
+    assert_ok(git(
+        &serving,
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            &format!("file://{}", forge.display()),
+            "topic",
+        ],
+    ));
+    let parent = String::from_utf8(git(&forge, &["rev-parse", "topic"]).stdout).unwrap();
+    let tree = String::from_utf8(git(&forge, &["rev-parse", "topic^{tree}"]).stdout).unwrap();
+    let ahead = String::from_utf8(
+        git(
+            &serving,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                parent.trim(),
+                "-m",
+                "operator ahead",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_ok(git(
+        &serving,
+        &["update-ref", "refs/heads/forward-ahead", ahead.trim()],
+    ));
+    assert_ok(git(
+        &forge,
+        &["update-ref", "refs/heads/forward-ahead", parent.trim()],
+    ));
+    assert_ok(receive("forward-ahead", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        ahead.as_bytes()
+    );
+    // An ahead commit with a promised blob unavailable upstream must not
+    // replace the already-complete upstream graph.
+    let missing_tree_input = root.join("missing-blob-tree");
+    fs::write(
+        &missing_tree_input,
+        format!("100644 blob {}\tmissing\n", "1".repeat(40)),
+    )
+    .unwrap();
+    let missing_tree = isolated_command("git", &serving, &root)
+        .args(["mktree", "--missing"])
+        .stdin(fs::File::open(&missing_tree_input).unwrap())
+        .output()
+        .unwrap();
+    assert!(missing_tree.status.success());
+    let missing_tree = String::from_utf8(missing_tree.stdout).unwrap();
+    let incomplete = git(
+        &serving,
+        &[
+            "commit-tree",
+            missing_tree.trim(),
+            "-p",
+            parent.trim(),
+            "-m",
+            "incomplete ahead",
+        ],
+    );
+    assert!(incomplete.status.success());
+    let incomplete = String::from_utf8(incomplete.stdout).unwrap();
+    assert_ok(git(
+        &serving,
+        &[
+            "update-ref",
+            "refs/heads/incomplete-ahead",
+            incomplete.trim(),
+        ],
+    ));
+    assert_ok(git(
+        &forge,
+        &["update-ref", "refs/heads/incomplete-ahead", parent.trim()],
+    ));
+    let received = receive("incomplete-ahead", false);
+    assert!(String::from_utf8_lossy(&received.stderr).contains("operator branch is incomplete"));
+    assert_ok(received);
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        parent.as_bytes()
+    );
+    assert_eq!(
+        git(&serving, &["rev-parse", "incomplete-ahead"]).stdout,
+        incomplete.as_bytes()
+    );
+    // Receive refreshes the publication origin, regardless of canonical upstream.
+    fs::write(home.join(".gitconfig"), &policy).unwrap();
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "-q",
+            forge.to_str().unwrap(),
+            fork.to_str().unwrap(),
+        ],
+    ));
+    let fork_parent = String::from_utf8(git(&fork, &["rev-parse", "HEAD"]).stdout).unwrap();
+    let fork_tree = String::from_utf8(git(&fork, &["rev-parse", "HEAD^{tree}"]).stdout).unwrap();
+    let first_fork = String::from_utf8(
+        git(
+            &fork,
+            &[
+                "commit-tree",
+                fork_tree.trim(),
+                "-p",
+                fork_parent.trim(),
+                "-m",
+                "first fork commit",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_ok(git(
+        &fork,
+        &["update-ref", "refs/heads/fork-only", first_fork.trim()],
+    ));
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "upstream", "git@github.com:test/fixture"],
+    ));
+    assert_ok(git(
+        &serving,
+        &["remote", "set-url", "origin", "git@github.com:test/fork"],
+    ));
+    assert_ok(git(&forge, &["branch", "canonical-only", "topic"]));
+    assert!(!receive("canonical-only", false).status.success());
+    assert_ok(receive("fork-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        first_fork.as_bytes()
+    );
+    assert_ok(git(
+        &serving,
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            &format!("file://{}", fork.display()),
+            "fork-only",
+        ],
+    ));
+    assert_ok(git(
+        &serving,
+        &["update-ref", "refs/heads/fork-only", first_fork.trim()],
+    ));
+    let second_fork = String::from_utf8(
+        git(
+            &fork,
+            &[
+                "commit-tree",
+                fork_tree.trim(),
+                "-p",
+                first_fork.trim(),
+                "-m",
+                "new fork commit",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_ok(git(
+        &fork,
+        &["update-ref", "refs/heads/fork-only", second_fork.trim()],
+    ));
+    assert_ok(receive("fork-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        second_fork.as_bytes()
+    );
+    assert_eq!(
+        git(&serving, &["rev-parse", "fork-only"]).stdout,
+        first_fork.as_bytes()
+    );
+    assert_ok(git(
+        &serving,
+        &["config", "branch.fork-only.remote", "upstream"],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "branch.fork-only.merge", "refs/heads/topic"],
+    ));
+    assert_ok(receive("fork-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "FETCH_HEAD"]).stdout,
+        second_fork.as_bytes()
+    );
+    assert_ok(git(
+        &serving,
+        &["config", "--unset", "branch.fork-only.remote"],
+    ));
+    let incomplete_commit = root.join("incomplete-commit");
+    fs::write(&incomplete_commit, format!("tree {}\nparent {}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nmissing promised parent\n", fork_tree.trim(), "0".repeat(39) + "1")).unwrap();
+    let incomplete = String::from_utf8(
+        git(
+            &serving,
+            &[
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                incomplete_commit.to_str().unwrap(),
+            ],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_ok(git(
+        &serving,
+        &["update-ref", "refs/heads/fork-only", incomplete.trim()],
+    ));
+    assert_ok(receive("fork-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "FETCH_HEAD"]).stdout,
+        second_fork.as_bytes()
+    );
+    // No origin needs no wrapped-key unlock, even with another remote configured.
+    fs::write(home.join(".gitconfig"), &policy).unwrap();
+    fs::rename(
+        data.join("publication.wrapped"),
+        data.join("unused.wrapped"),
+    )
+    .unwrap();
+    assert_ok(git(&serving, &["remote", "remove", "origin"]));
+    assert_ok(git(&serving, &["remote", "remove", "unrelated"]));
+    assert_ok(git(&serving, &["branch", "operator-only"]));
+    assert_ok(git(
+        &serving,
+        &["config", "remote.phantom.promisor", "true"],
+    ));
+    assert_ok(receive("operator-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "operator-only"]).stdout,
+        git(&serving, &["rev-parse", "HEAD"]).stdout
+    );
+    let local_forge = home.join("local-forge.git");
+    assert_ok(git(
+        &home,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "-q",
+            forge.to_str().unwrap(),
+            local_forge.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&local_forge, &["branch", "file-upstream-only"]));
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "origin", local_forge.to_str().unwrap()],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "remote.upstream.promisor", "true"],
+    ));
+    assert_ok(receive("file-upstream-only", false));
+    assert_eq!(
+        git(&client, &["rev-parse", "file-upstream-only"]).stdout,
+        git(&local_forge, &["rev-parse", "HEAD"]).stdout
+    );
+    // An ignored SSH upstream must not require a key when origin is local.
+    assert_ok(git(
+        &serving,
+        &["config", "--remove-section", "remote.upstream"],
+    ));
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "upstream", "git@github.com:test/fork"],
+    ));
+    assert_ok(receive("file-upstream-only", false));
+    assert!(
+        !upload_environment_error.exists(),
+        "raw upload retained credential routing"
+    );
+}
+
+#[test]
+fn receive_reuses_operator_objects_without_a_porter_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let forge = root.join("forge");
+    let serving = root.join("serving");
+    let client = root.join("client");
+    let bin = root.join("bin");
+    for path in [&forge, &client, &bin] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let git = |path: &Path, args: &[&str]| {
+        isolated_command("git", path, &root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_ok(git(&forge, &["init", "-q", "-b", "main"]));
+    for i in 0..30_000 {
+        fs::write(
+            forge.join(format!("file-{i:05}")),
+            format!("distinct fixture blob {i}\n"),
+        )
+        .unwrap();
+    }
+    assert_ok(git(&forge, &["add", "."]));
+    assert_ok(git(&forge, &["commit", "-qm", "large graph"]));
+    let listing = git(
+        &forge,
+        &["rev-list", "--objects", "--no-object-names", "main"],
+    );
+    assert!(listing.stdout.len() > 1024 * 1024);
+    let main = git(&forge, &["rev-parse", "main"]).stdout;
+    assert_ok(git(&forge, &["branch", "a/refs/heads/main"]));
+    assert_ok(git(&forge, &["config", "uploadpack.allowFilter", "true"]));
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", forge.display()),
+            serving.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(
+        &serving,
+        &["remote", "set-url", "origin", "git@fixture.invalid:repo"],
+    ));
+    let packets = root.join("packets");
+    let upstream = root.join("upstream-ssh");
+    fs::write(
+        &upstream,
+        format!(
+            "#!/bin/sh\nGIT_TRACE_PACKET={} exec git-upload-pack {}\n",
+            quote(&packets),
+            quote(&forge)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&upstream, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ok(git(
+        &serving,
+        &["config", "core.sshCommand", upstream.to_str().unwrap()],
+    ));
+    assert_ok(git(&serving, &["config", "ssh.variant", "ssh"]));
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_git-porter"), bin.join("git-porter")).unwrap();
+    let incoming = root.join("incoming");
+    fs::write(&incoming, "#!/bin/sh\nfor arg do remote=$arg; done\nunset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT\nexec /bin/sh -c \"$remote\"\n").unwrap();
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let remote_login = fs::read_to_string(&incoming).unwrap().replacen(
+        "\nexec ",
+        &format!("\nexport PATH={}\nexec ", quote(Path::new(&path))),
+        1,
+    );
+    fs::write(&incoming, remote_login).unwrap();
+    assert_ok(git(&client, &["init", "-q", "-b", "main"]));
+    let receive = |repository: &Path, branch: &str| {
+        isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root)
+            .env("PATH", &path)
+            .env("GIT_SSH_COMMAND", &incoming)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .args([
+                "--switch",
+                "--branch",
+                branch,
+                &format!("operator:{}", repository.display()),
+            ])
+            .output()
+            .unwrap()
+    };
+    assert_ok(receive(&serving, "main"));
+    assert_eq!(git(&client, &["rev-parse", "main"]).stdout, main);
+    let cache_root = root.join("XDG_CACHE_HOME/git-porter/read-objects");
+    assert!(!cache_root.exists());
+    let pack_bytes = || {
+        fs::read_dir(serving.join(".git/objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "pack"))
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum::<u64>()
+    };
+    let base_size = pack_bytes();
+    assert!(base_size > 0);
+    for name in ["topic1", "topic2"] {
+        assert_ok(git(&forge, &["switch", "-c", name, "main"]));
+        fs::write(forge.join("file-00000"), format!("change for {name}\n")).unwrap();
+        assert_ok(git(&forge, &["commit", "-qam", name]));
+        fs::write(&packets, "").unwrap();
+        assert_ok(receive(&serving, name));
+        assert_eq!(
+            git(&client, &["rev-parse", "HEAD"]).stdout,
+            git(&forge, &["rev-parse", name]).stdout
+        );
+        assert!(
+            fs::read_to_string(&packets).unwrap().contains("have "),
+            "new branches must negotiate using cached history"
+        );
+    }
+    assert!(
+        pack_bytes() < base_size * 3 / 2,
+        "new branches duplicated full-history packs"
+    );
+    // Tracking updates must not follow an unexpected symbolic ref into a
+    // checked-out branch or execute source-configured reference/upload hooks.
+    let hooks = root.join("operator-hooks");
+    let hook_used = root.join("operator-hook-used");
+    fs::create_dir(&hooks).unwrap();
+    fs::write(
+        hooks.join("reference-transaction"),
+        format!("#!/bin/sh\n: > {}\nexit 1\n", quote(&hook_used)),
+    )
+    .unwrap();
+    fs::set_permissions(
+        hooks.join("reference-transaction"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_ok(git(
+        &serving,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/topic1",
+            "refs/heads/main",
+        ],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "uploadpack.packObjectsHook", "exit 99"],
+    ));
+    let operator_config = fs::read(serving.join(".git/config")).unwrap();
+    assert_ok(receive(&serving, "topic1"));
+    assert!(!hook_used.exists());
+    assert!(
+        !git(
+            &serving,
+            &["symbolic-ref", "-q", "refs/remotes/origin/topic1"]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        fs::read(serving.join(".git/config")).unwrap(),
+        operator_config
+    );
+    assert_eq!(git(&serving, &["rev-parse", "HEAD"]).stdout, main);
+    assert_ok(git(&serving, &["config", "--unset", "core.hooksPath"]));
+    assert_ok(git(
+        &serving,
+        &["config", "--unset", "uploadpack.packObjectsHook"],
+    ));
+    assert!(!cache_root.exists());
+    assert_eq!(
+        git(&serving, &["rev-parse", "refs/remotes/origin/topic2"]).stdout,
+        git(&forge, &["rev-parse", "topic2"]).stdout
+    );
+    assert_eq!(git(&serving, &["rev-parse", "HEAD"]).stdout, main);
+    use std::io::{Read, Write};
+    let want = format!("want {}\n", std::str::from_utf8(&main).unwrap().trim());
+    // HEAD has a unique promised blob outside both topics. Receiving topic1
+    // completes only its history; topic2 must reuse that sibling tracking tip.
+    assert_ok(git(&forge, &["switch", "main"]));
+    fs::write(forge.join("main-only"), "not reachable from the topics\n").unwrap();
+    assert_ok(git(&forge, &["add", "main-only"]));
+    assert_ok(git(&forge, &["commit", "-qm", "main-only history"]));
+    let partial = root.join("incomplete-head");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", forge.display()),
+            partial.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(
+        &partial,
+        &["remote", "set-url", "origin", "git@fixture.invalid:repo"],
+    ));
+    assert_ok(git(
+        &partial,
+        &["config", "core.sshCommand", upstream.to_str().unwrap()],
+    ));
+    assert_ok(git(&partial, &["config", "ssh.variant", "ssh"]));
+    assert_ok(receive(&partial, "topic1"));
+    let complete = |reference: &str| {
+        isolated_command("git", &partial, &root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "rev-list",
+                "--objects",
+                "--quiet",
+                "--missing=error",
+                reference,
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(complete("refs/remotes/origin/topic1"));
+    assert!(!complete("HEAD"));
+    assert!(!complete("refs/remotes/origin/topic2"));
+    fs::write(&packets, "").unwrap();
+    assert_ok(receive(&partial, "topic2"));
+    assert!(
+        fs::read_to_string(&packets).unwrap().contains("have "),
+        "receive ignored a complete sibling origin-tracking branch"
+    );
+    assert!(complete("refs/remotes/origin/topic2"));
+    let fork = root.join("native-fork.git");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "-q",
+            forge.to_str().unwrap(),
+            fork.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&fork, &["branch", "native-fork-only"]));
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "upstream", forge.to_str().unwrap()],
+    ));
+    assert_ok(git(
+        &serving,
+        &["remote", "set-url", "origin", fork.to_str().unwrap()],
+    ));
+    assert_ok(git(&forge, &["branch", "native-canonical-only", "main"]));
+    assert!(!receive(&serving, "native-canonical-only").status.success());
+    assert_ok(git(
+        &serving,
+        &["config", "branch.native-fork-only.remote", "upstream"],
+    ));
+    assert_ok(git(
+        &serving,
+        &["config", "branch.native-fork-only.merge", "refs/heads/main"],
+    ));
+    assert_ok(receive(&serving, "native-fork-only"));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        git(&fork, &["rev-parse", "native-fork-only"]).stdout
+    );
+    let standalone = root.join("standalone");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            forge.to_str().unwrap(),
+            standalone.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(
+        &standalone,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            std::str::from_utf8(&main).unwrap().trim(),
+        ],
+    ));
+    assert_ok(git(&standalone, &["remote", "remove", "origin"]));
+    fs::write(
+        root.join(".gitconfig"),
+        "[remote \"origin\"]\npromisor = true\npartialclonefilter = blob:none\n",
+    )
+    .unwrap();
+    let wrapper = fs::read_to_string(&incoming).unwrap().replace(
+        "unset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT",
+        "unset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT GIT_CONFIG_GLOBAL",
+    );
+    fs::write(&incoming, wrapper).unwrap();
+    // Complete local history is served from the operator store. Standard Git
+    // collection preserves history referenced by the operator branch.
+    let mut pinned_read = isolated_command(env!("CARGO_BIN_EXE_git-porter"), &root, &root)
+        .env("PATH", &path)
+        .args([
+            "internal:read",
+            standalone.to_str().unwrap(),
+            "refs/heads/main",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut advertised = std::io::BufReader::new(pinned_read.stdout.take().unwrap());
+    loop {
+        let mut header = [0; 4];
+        advertised.read_exact(&mut header).unwrap();
+        let size = usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+        if size == 0 {
+            break;
+        }
+        let mut row = vec![0; size - 4];
+        advertised.read_exact(&mut row).unwrap();
+    }
+    assert_ok(git(&standalone, &["gc", "--prune=now"]));
+    let mut input = pinned_read.stdin.take().unwrap();
+    writeln!(input, "{:04x}{want}00000009done", want.len() + 4).unwrap();
+    drop(input);
+    let mut pack = Vec::new();
+    advertised.read_to_end(&mut pack).unwrap();
+    drop(advertised);
+    let result = pinned_read.wait_with_output().unwrap();
+    assert_ok(result);
+    let offset = pack
+        .windows(4)
+        .position(|bytes| bytes == b"PACK")
+        .expect("missing pack");
+    let pack_path = root.join("pinned-transfer.pack");
+    fs::write(&pack_path, &pack[offset..]).unwrap();
+    let validation = root.join("validate-pinned.git");
+    assert_ok(git(
+        &root,
+        &["init", "--bare", "-q", validation.to_str().unwrap()],
+    ));
+    assert_ok(
+        isolated_command("git", &validation, &root)
+            .args(["index-pack", "--strict", "--stdin"])
+            .stdin(fs::File::open(pack_path).unwrap())
+            .output()
+            .unwrap(),
+    );
+    assert_ok(git(
+        &validation,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            std::str::from_utf8(&main).unwrap().trim(),
+        ],
+    ));
+    assert_ok(git(&validation, &["fsck", "--full"]));
+    assert_ok(receive(&standalone, "main"));
+    assert_eq!(git(&client, &["rev-parse", "HEAD"]).stdout, main);
+    assert_ok(git(
+        &standalone,
+        &["remote", "add", "origin", forge.to_str().unwrap()],
+    ));
+    assert_ok(receive(&standalone, "topic1"));
+    let plain = standalone.join("plain/sub");
+    fs::create_dir_all(&plain).unwrap();
+    let refused = isolated_command(env!("CARGO_BIN_EXE_git-porter"), &root, &root)
+        .env("PATH", &path)
+        .args(["internal:read", plain.to_str().unwrap(), "refs/heads/main"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let mut rows = String::from_utf8(
+        git(
+            &standalone,
+            &["for-each-ref", "--format=%(objectname) %(refname)"],
+        )
+        .stdout,
+    )
+    .unwrap()
+    .lines()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let oid = std::str::from_utf8(&main).unwrap().trim();
+    for index in 0..20_000 {
+        rows.push(format!("{oid} refs/remotes/r{index:05}/main"));
+    }
+    rows.sort_by(|a, b| {
+        a.split_once(' ')
+            .unwrap()
+            .1
+            .cmp(b.split_once(' ').unwrap().1)
+    });
+    fs::write(
+        standalone.join(".git/packed-refs"),
+        format!(
+            "# pack-refs with: peeled fully-peeled sorted\n{}\n",
+            rows.join("\n")
+        ),
+    )
+    .unwrap();
+    assert!(
+        git(
+            &root,
+            &["ls-remote", "--refs", standalone.to_str().unwrap(), "main"]
+        )
+        .stdout
+        .len()
+            > 1024 * 1024
+    );
+    let git_shell = git_porter::server::config::executable("git-shell").unwrap();
+    let shell_ssh = root.join("git-shell-ssh");
+    fs::write(&shell_ssh, format!("#!/bin/sh\nfor arg do remote=$arg; done\nunset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT\nexec {} -c \"$remote\"\n", quote(&git_shell))).unwrap();
+    fs::set_permissions(&shell_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let shell_receive = |local: bool| {
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root);
+        command
+            .env("PATH", &path)
+            .env("GIT_SSH_COMMAND", &shell_ssh)
+            .env("GIT_SSH_VARIANT", "ssh");
+        if local {
+            command.arg("--local-only");
+        }
+        command
+            .args([
+                "--switch",
+                "--branch",
+                "main",
+                &format!("operator:{}", standalone.display()),
+            ])
+            .output()
+            .unwrap()
+    };
+    let unsupported = shell_receive(false);
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("--local-only"));
+    assert_ok(shell_receive(true));
+    assert_eq!(git(&client, &["rev-parse", "HEAD"]).stdout, main);
+}
+
+#[test]
+fn native_receive_accepts_legacy_history_and_hydrates_operator_objects() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let forge = root.join("forge.git");
+    let serving = root.join("serving.git");
+    let partial = root.join("partial.git");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fetches = root.join("snapshot-fetches");
+    let advertisements = root.join("snapshot-advertisements");
+    let actual_git = git_porter::server::config::executable("git").unwrap();
+    fs::write(bin.join("git"), format!("#!/bin/sh\nfor arg do case \"$arg\" in fetch) echo fetch >> {} ;; ls-remote) echo advertisement >> {} ;; esac; done\nexec {} \"$@\"\n", quote(&fetches), quote(&advertisements), quote(&actual_git))).unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let git = |path: &Path, args: &[&str]| {
+        isolated_command("git", path, &root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_ok(git(
+        &root,
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            forge.to_str().unwrap(),
+        ],
+    ));
+    let write_object = |repo: &Path, kind: &str, bytes: &[u8]| {
+        let input = root.join("object-input");
+        fs::write(&input, bytes).unwrap();
+        let result = isolated_command("git", repo, &root)
+            .args(["hash-object", "--literally", "-w", "-t", kind, "--stdin"])
+            .stdin(fs::File::open(input).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().to_owned()
+    };
+    let blob = write_object(&forge, "blob", b"historical blob\n");
+    let mut tree = b"0100644 legacy\0".to_vec();
+    for pair in blob.as_bytes().chunks_exact(2) {
+        tree.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+    }
+    let tree = write_object(&forge, "tree", &tree);
+    let commit = write_object(&forge, "commit", format!("tree {tree}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nlegacy filemode\n").as_bytes());
+    assert_ok(git(&forge, &["update-ref", "refs/heads/main", &commit]));
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "-q",
+            forge.to_str().unwrap(),
+            serving.to_str().unwrap(),
+        ],
+    ));
+    let read = |repo: &Path, branch: &str, tip: &str| {
+        let want = format!("want {tip}\n");
+        let input = root.join("read-input");
+        fs::write(
+            &input,
+            format!("{:04x}{want}00000009done\n", want.len() + 4),
+        )
+        .unwrap();
+        let result = isolated_command(env!("CARGO_BIN_EXE_git-porter"), &root, &root)
+            .env("PATH", &path)
+            .args([
+                "internal:read",
+                repo.to_str().unwrap(),
+                &format!("refs/heads/{branch}"),
+            ])
+            .stdin(fs::File::open(input).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "read {branch} from {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let offset = result
+            .stdout
+            .windows(4)
+            .position(|bytes| bytes == b"PACK")
+            .expect("missing pack");
+        let pack = root.join("read.pack");
+        fs::write(&pack, &result.stdout[offset..]).unwrap();
+        let validation = tempfile::tempdir_in(&root).unwrap();
+        assert_ok(git(
+            &root,
+            &["init", "--bare", "-q", validation.path().to_str().unwrap()],
+        ));
+        assert_ok(
+            isolated_command("git", validation.path(), &root)
+                .args(["index-pack", "--stdin"])
+                .stdin(fs::File::open(pack).unwrap())
+                .output()
+                .unwrap(),
+        );
+        assert_ok(git(validation.path(), &["rev-list", "--objects", tip]));
+    };
+    // The wire envelope is permissive; actual Git grammar must still reject an
+    // invalid branch before attempting origin discovery or object transfer.
+    let invalid = isolated_command(env!("CARGO_BIN_EXE_git-porter"), &root, &root)
+        .env("PATH", &path)
+        .args([
+            "internal:read",
+            serving.to_str().unwrap(),
+            "refs/heads/topic..bad",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid receive branch"));
+    assert!(!fetches.exists());
+    assert!(!advertisements.exists());
+    // A normal clone/fetch accepts this tree; borrowing its objects must too.
+    read(&serving, "main", &commit);
+    let ahead = write_object(&serving, "commit", format!("tree {tree}\nparent {commit}\nauthor Fixture <fixture@example.invalid> 2 +00001\ncommitter Fixture <fixture@example.invalid> 2 +00001\n\nlegacy timezone\n").as_bytes());
+    assert_ok(git(&serving, &["update-ref", "refs/heads/ahead", &ahead]));
+    read(&serving, "ahead", &ahead);
+    // No origin must import the local graph directly, without a self-fetch.
+    let fetch_before = fs::read(&fetches).unwrap();
+    let advertisement_before = fs::read(&advertisements).unwrap();
+    assert_ok(git(&serving, &["remote", "remove", "origin"]));
+    read(&serving, "main", &commit);
+    read(&serving, "ahead", &ahead);
+    assert_eq!(fs::read(&fetches).unwrap(), fetch_before);
+    assert_eq!(fs::read(&advertisements).unwrap(), advertisement_before);
+    // A shallow boundary must not make an incomplete no-origin graph appear
+    // complete, or suggest retrying an operation that cannot recover its parents.
+    let shallow = root.join("shallow-native.git");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            "--depth=1",
+            "--branch",
+            "ahead",
+            &format!("file://{}", serving.display()),
+            shallow.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&shallow, &["remote", "remove", "origin"]));
+    let boundary = fs::read(shallow.join("shallow")).unwrap();
+    let unavailable = isolated_command(env!("CARGO_BIN_EXE_git-porter"), &root, &root)
+        .env("PATH", &path)
+        .args([
+            "internal:read",
+            shallow.to_str().unwrap(),
+            "refs/heads/ahead",
+        ])
+        .output()
+        .unwrap();
+    assert!(!unavailable.status.success());
+    assert!(
+        unavailable.stdout.is_empty(),
+        "incomplete history was advertised"
+    );
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("incomplete and has no origin"));
+    assert!(!String::from_utf8_lossy(&unavailable.stderr).contains("retry receive"));
+    assert_eq!(fs::read(shallow.join("shallow")).unwrap(), boundary);
+    assert_eq!(fs::read(&fetches).unwrap(), fetch_before);
+    assert_eq!(fs::read(&advertisements).unwrap(), advertisement_before);
+
+    // The requested local ref points to a promised commit absent from the
+    // operator store. Only the approved explicit origin route may fetch it.
+    assert_ok(git(
+        &root,
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            partial.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(
+        &partial,
+        &["remote", "add", "origin", forge.to_str().unwrap()],
+    ));
+    assert_ok(git(&partial, &["config", "remote.origin.promisor", "true"]));
+    assert_ok(git(
+        &partial,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    ));
+    fs::write(partial.join("refs/heads/main"), format!("{commit}\n")).unwrap();
+    let object_counts = || git(&partial, &["count-objects", "-v"]).stdout;
+    let before = object_counts();
+    read(&partial, "main", &commit);
+    assert_ne!(
+        object_counts(),
+        before,
+        "explicit origin fetch must hydrate operator objects"
+    );
+    // More than one old argv batch of missing blobs must use one connection.
+    let mut import = String::new();
+    for i in 1..=520 {
+        let data = format!("promised blob {i}\n");
+        import.push_str(&format!("blob\nmark :{i}\ndata {}\n{data}", data.len()));
+    }
+    import.push_str("commit refs/heads/fixture\ncommitter Fixture <fixture@example.invalid> 3 +0000\ndata 8\nfixture\n");
+    for i in 1..=520 {
+        import.push_str(&format!("M 100644 :{i} file-{i}\n"));
+    }
+    import.push('\n');
+    let input = root.join("fast-import-input");
+    fs::write(&input, import).unwrap();
+    assert_ok(
+        isolated_command("git", &forge, &root)
+            .args(["fast-import", "--quiet"])
+            .stdin(fs::File::open(input).unwrap())
+            .output()
+            .unwrap(),
+    );
+    let tip = String::from_utf8(git(&forge, &["rev-parse", "fixture"]).stdout).unwrap();
+    let tree_bytes = git(&forge, &["cat-file", "tree", "fixture^{tree}"]).stdout;
+    write_object(&partial, "tree", &tree_bytes);
+    let commit_bytes = git(&forge, &["cat-file", "commit", "fixture"]).stdout;
+    write_object(&partial, "commit", &commit_bytes);
+    assert_ok(git(
+        &partial,
+        &["update-ref", "refs/heads/unpublished", tip.trim()],
+    ));
+    assert_ok(git(&forge, &["update-ref", "-d", "refs/heads/fixture"]));
+    assert_ok(git(
+        &forge,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    ));
+    let count = || fs::read_to_string(&fetches).unwrap().lines().count();
+    let previous = count();
+    let prepared = object_counts();
+    read(&partial, "unpublished", tip.trim());
+    assert_eq!(
+        count() - previous,
+        1,
+        "missing objects opened multiple upstream connections"
+    );
+    assert_ne!(
+        object_counts(),
+        prepared,
+        "hydration must persist in operator objects"
+    );
+}
+
+#[test]
+fn restricted_receive_accepts_legacy_history_and_ignores_unselected_remote_urls() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let forge = root.join("forge.git");
+    let serving = root.join("serving.git");
+    let client = root.join("client");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let transports = root.join("snapshot-transports");
+    let actual_git = git_porter::server::config::executable("git").unwrap();
+    fs::write(bin.join("git"), format!("#!/bin/sh\nif test -n \"${{GIT_DIR-}}\"; then for arg do case \"$arg\" in fetch|ls-remote) echo transport >> {} ;; esac; done; fi\nexec {} \"$@\"\n", quote(&transports), quote(&actual_git))).unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let git = |path: &Path, args: &[&str]| {
+        isolated_command("git", path, &root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for repo in [&forge, &serving] {
+        assert_ok(git(
+            &root,
+            &["init", "--bare", "-q", "-b", "main", repo.to_str().unwrap()],
+        ));
+    }
+    assert_ok(git(
+        &root,
+        &["init", "-q", "-b", "main", client.to_str().unwrap()],
+    ));
+    let write_object = |kind: &str, bytes: &[u8]| {
+        let input = root.join("object-input");
+        fs::write(&input, bytes).unwrap();
+        let result = isolated_command("git", &forge, &root)
+            .args(["hash-object", "--literally", "-w", "-t", kind, "--stdin"])
+            .stdin(fs::File::open(input).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().to_owned()
+    };
+    let blob = write_object("blob", b"legacy content\n");
+    let mut raw_tree = b"0100644 file\0".to_vec();
+    for pair in blob.as_bytes().chunks_exact(2) {
+        raw_tree.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+    }
+    let tree = write_object("tree", &raw_tree);
+    let commit = write_object("commit", format!("tree {tree}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nlegacy tree\n").as_bytes());
+    assert_ok(git(&forge, &["update-ref", "refs/heads/main", &commit]));
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "origin", forge.to_str().unwrap()],
+    ));
+    let data = root.join("XDG_DATA_HOME/git-porter");
+    fs::create_dir_all(data.join("transport")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_git-porter"), data.join("transport/ssh"))
+        .unwrap();
+    let key =
+        ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    fs::write(
+        root.join(".gitconfig"),
+        format!(
+            "[porter]\nsearchRoot = {}\nauthorizedKey = {}\n",
+            root.display(),
+            key.public_key().to_openssh().unwrap()
+        ),
+    )
+    .unwrap();
+    let incoming = root.join("restricted-ssh");
+    fs::write(&incoming, format!("#!/bin/sh\nfor arg do SSH_ORIGINAL_COMMAND=$arg; done\nexport SSH_ORIGINAL_COMMAND\nexport PATH={}\nunset GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT GIT_NO_LAZY_FETCH\nexec {} internal:serve\n", quote(Path::new(&path)), quote(Path::new(env!("CARGO_BIN_EXE_git-porter"))))).unwrap();
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+    let receive = |repo: &Path, branch: &str| {
+        isolated_command(env!("CARGO_BIN_EXE_git-receive"), &client, &root)
+            .env("PATH", &path)
+            .env("GIT_SSH_COMMAND", &incoming)
+            .env("GIT_SSH_VARIANT", "ssh")
+            .args([
+                "--switch",
+                "--branch",
+                branch,
+                &format!("operator:{}", repo.display()),
+            ])
+            .output()
+            .unwrap()
+    };
+    // The serving repository is empty: this must fetch the legacy tree into a
+    // operator object store through the restricted authenticated fetch path.
+    let operator_objects = git(&serving, &["count-objects", "-v"]).stdout;
+    assert_ok(receive(&serving, "main"));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        format!("{commit}\n").as_bytes()
+    );
+    assert_ne!(
+        git(&serving, &["count-objects", "-v"]).stdout,
+        operator_objects
+    );
+    assert!(!root.join("XDG_CACHE_HOME/git-porter/read-objects").exists());
+    let timezone = write_object("commit", format!("tree {tree}\nparent {commit}\nauthor Fixture <fixture@example.invalid> 2 +00001\ncommitter Fixture <fixture@example.invalid> 2 +00001\n\nlegacy timezone\n").as_bytes());
+    assert_ok(git(
+        &forge,
+        &["update-ref", "refs/heads/timezone", &timezone],
+    ));
+    assert_ok(receive(&serving, "timezone"));
+    assert_eq!(
+        git(&client, &["rev-parse", "HEAD"]).stdout,
+        format!("{timezone}\n").as_bytes()
+    );
+    // URL cardinality belongs to selected candidates, not unrelated remotes.
+    assert_ok(git(
+        &serving,
+        &["remote", "add", "unused", forge.to_str().unwrap()],
+    ));
+    assert_ok(git(
+        &serving,
+        &[
+            "config",
+            "--add",
+            "remote.unused.url",
+            root.join("absent").to_str().unwrap(),
+        ],
+    ));
+    assert_ok(receive(&serving, "main"));
+    assert_ok(git(&serving, &["config", "branch.main.remote", "unused"]));
+    assert_ok(git(
+        &serving,
+        &["config", "branch.main.merge", "refs/heads/absent"],
+    ));
+    assert_ok(receive(&serving, "main"));
+    assert_ok(git(
+        &serving,
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            root.join("absent").to_str().unwrap(),
+        ],
+    ));
+    let rejected = receive(&serving, "main");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("exactly one fetch URL"));
+    // No upstream also accepts complete legacy history, without a credential.
+    let local = root.join("local.git");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "-q",
+            forge.to_str().unwrap(),
+            local.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&local, &["remote", "remove", "origin"]));
+    assert_ok(git(
+        &local,
+        &["remote", "add", "upstream", forge.to_str().unwrap()],
+    ));
+    assert_ok(git(&forge, &["branch", "origin-absent-only", "main"]));
+    assert!(!receive(&local, "origin-absent-only").status.success());
+    let transports_before = fs::read(&transports).unwrap();
+    assert!(
+        !transports_before.is_empty(),
+        "transport spy did not observe the origin fetch"
+    );
+    assert_ok(receive(&local, "main"));
+    assert_ok(receive(&local, "timezone"));
+    assert_eq!(fs::read(&transports).unwrap(), transports_before);
+    let shallow = root.join("shallow-restricted.git");
+    assert_ok(git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            "--depth=1",
+            "--branch",
+            "timezone",
+            &format!("file://{}", forge.display()),
+            shallow.to_str().unwrap(),
+        ],
+    ));
+    assert_ok(git(&shallow, &["remote", "remove", "origin"]));
+    let unavailable = receive(&shallow, "timezone");
+    assert!(!unavailable.status.success());
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("incomplete and has no origin"));
+    assert!(!String::from_utf8_lossy(&unavailable.stderr).contains("retry receive"));
+    assert_eq!(fs::read(&transports).unwrap(), transports_before);
 }

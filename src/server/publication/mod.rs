@@ -401,7 +401,7 @@ fn publication_result(
 /// Isolated publication Git context using only the compiled transport role,
 /// the transaction-selected agent/public reference and per-transaction trust.
 /// Lazy fetches are permitted here: the context's only promisor is the pinned origin.
-fn onward_git(
+pub(crate) fn onward_git(
     config: &crate::server::config::ServerConfig,
     access: &crate::server::access::Access,
     gitdir: &Path,
@@ -613,7 +613,9 @@ fn protect_default_branch(
 pub fn account_socket() -> Result<PathBuf> {
     account_socket_with(None)
 }
-fn account_socket_with(session: Option<&crate::runtime::supervision::Session>) -> Result<PathBuf> {
+pub(crate) fn account_socket_with(
+    session: Option<&crate::runtime::supervision::Session>,
+) -> Result<PathBuf> {
     use std::os::unix::fs::FileTypeExt;
     let socket = PathBuf::from(
         std::env::var_os("SSH_AUTH_SOCK")

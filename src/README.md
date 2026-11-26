@@ -24,7 +24,10 @@ those credentials may be used. The git_porter library is internal: binaries and 
 use these subsystem paths directly, without a second layer of compatibility aliases.
 
 [Client orchestration](cli/client/mod.rs) owns branch operations;
-[hydration](cli/client/hydration.rs) prepares sender objects and history; the
+[hydration](cli/client/hydration.rs) prepares sender objects and history;
+[receive preparation](runtime/read.rs) fetches and hydrates operator objects,
+with [restricted upstream selection](server/access/read.rs) and
+[ordinary SSH preparation](cli/client/read.rs); the
 [transport role](cli/client/transport.rs) owns SSH negotiation and byte handoff,
 [key commands](cli/keys.rs) handle enrollment and prompts,
 [provisioning](cli/client/provision.rs) owns approved remote key participation,
