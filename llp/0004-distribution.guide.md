@@ -134,8 +134,9 @@ owner's responsibility.
 Run locked Rust workspace tests (unit logic plus focused porter-boundary tests),
 formatting/clippy, Python LLP fixtures/checker, Nix builds, explicit OpenSSH and
 Home Manager acceptance, and extracted-package install checks. CI runs workspace
-tests once per advertised platform through the Nix package check phase, not again
-in the quality job. Run OpenSSH and extracted-package checks on each platform;
+tests explicitly once per advertised platform in CI, not again in the quality
+job. Nix package builds skip the check phase; tests remain explicit development
+commands. Run OpenSSH and extracted-package checks on each platform;
 run generated Home Manager integration once on x86_64 Linux. Per-platform
 OpenSSH acceptance covers runtime portability. Use synthetic credentials,
 isolated homes and fixture daemons.

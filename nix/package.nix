@@ -12,10 +12,8 @@ buildPkgs.rustPlatform.buildRustPackage {
   version = metadata.package.version;
   inherit src;
   cargoLock.lockFile = src + /Cargo.lock;
-  nativeCheckInputs = [
-    native.git
-    native.openssh
-  ];
+  # Unit and integration tests stay explicit development commands.
+  doCheck = false;
   postInstall = ''
     mkdir -p "$out/share/doc/git-porter"
     cp README.md LICENSE "$out/share/doc/git-porter/"
