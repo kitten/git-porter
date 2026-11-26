@@ -1,4 +1,4 @@
-name: Prepare draft release
+name: Release
 on:
   push:
     tags: ["v*"]
@@ -12,7 +12,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       release_tag: ${{ github.ref_name }}
-  draft:
+  publish:
     needs: [checks]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -33,7 +33,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: nix develop -c python3 scripts/package_release.py --manifest dist --tag "$RELEASE_TAG"
-      - name: Prepare verified draft; publication requires operator action
+      - name: Publish checked archives
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -47,7 +47,8 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber
           if [[ "$RELEASE_TAG" == *-* ]]; then
-            gh release edit "$RELEASE_TAG" --prerelease --latest=false
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
           fi
-          echo "Verified draft prepared. Publication and visibility require separate operator authorization."
           SCRIPT

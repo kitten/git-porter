@@ -20,9 +20,11 @@ archives/checksums and verifies their bytes before SHA256SUMS. Compare release
 tags to Cargo metadata. Inspect native linkage and reject concrete Nix store
 dependencies in shipped executables, retaining the literal security policy
 prefix constant. CI uses Rust tests/acceptance and pinned actions/read-only
-default permissions. Release automation stops at a verified draft.
-Publication/visibility are separate operator decisions; no successful test or
-tag implies permission to activate.
+default permissions. Version tags trigger automatic publication after CI and
+complete asset verification. Upload assets to a temporary draft, then publish it
+in the same job; no manual draft-publishing step is required. Mark prerelease
+tags as prereleases and not latest. Refuse to replace an already published
+release. Release publication does not authorize activation.
 
 ## Setup
 
@@ -144,8 +146,8 @@ Exercise default publication, local-only send, receive, remote/inline key
 creation, missing/malformed metadata, domain separation,
 rewrite/ref/worktree/lease protection, prompt/network timeouts and cancellation.
 Report native vs emulated and actual vs unrun checks accurately. Real-account
-acceptance, activation, source deletion and public release retain separate
-gates.
+acceptance, activation and source deletion retain separate gates. Public releases
+use the verified tag-triggered workflow described above.
 
 ## Terminal output
 
